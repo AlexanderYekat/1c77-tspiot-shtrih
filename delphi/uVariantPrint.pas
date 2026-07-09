@@ -28,6 +28,7 @@ type
 
     FEmulatedSerial: string;
     FEmulatedInn: string;
+    FEmulatedRegNumber: string;
     FEmulatedFnNumber: string;
     FEmulatedCheckNumber: Integer;
     FEmulatedSessionNumber: Integer;
@@ -253,6 +254,7 @@ begin
   FEmulation := FSettings.ReadBool('KKT', 'Emulation', False);
   FEmulatedSerial := FSettings.ReadString('KKT', 'EmulatedSerial', '0000000000000001');
   FEmulatedInn := FSettings.ReadString('KKT', 'EmulatedInn', '1234567890');
+  FEmulatedRegNumber := FSettings.ReadString('KKT', 'EmulatedRegNumber', '1234567111890');
   FEmulatedFnNumber := FSettings.ReadString('KKT', 'EmulatedFnNumber', '9999078900000001');
   FEmulatedCheckNumber := FSettings.ReadInteger('KKT', 'EmulatedCheckNumber', 0);
   FEmulatedSessionNumber := FSettings.ReadInteger('KKT', 'EmulatedSessionNumber', 0);
@@ -571,7 +573,7 @@ end;
 
 function TVariantPrint.KktInfoJson: string;
 var
-  SerialNumber, Inn, FnNumber: string;
+  SerialNumber, KKTRegistrationNumber, Inn, FnNumber: string;
 begin
   FLock.Enter;
   try
@@ -580,6 +582,7 @@ begin
 
       SerialNumber := FEmulatedSerial;
       Inn := FEmulatedInn;
+      KKTRegistrationNumber:=FEmulatedRegNumber;
       FnNumber := FEmulatedFnNumber;
 
       if not (VarIsEmpty(ovObject) or VarIsNull(ovObject)) then
@@ -590,15 +593,18 @@ begin
           SerialNumber := ReadSerialNumber;
 
           try
-            ovObject.GetFiscalizationParameters;
-            CheckFRResult('GetFiscalizationParameters');
+            ovObject.FNGetFiscalizationResult;
+            CheckFRResult('FNGetFiscalizationResult');
             try Inn := VarToStr(ovObject.INN); except end;
-            try FnNumber := VarToStr(ovObject.FNNumber); except end;
+            try KKTRegistrationNumber := VarToStr(ovObject.KKTRegistrationNumber); except end;
+            ovObject.FNGetSerial;
+            CheckFRResult('FNGetSerial');
+            try FnNumber := VarToStr(ovObject.SerialNumber); except end;
             try if FnNumber = '' then FnNumber := VarToStr(ovObject.FiscalStorageNumber); except end;
           except
             on E: Exception do
             begin
-              FLog.LogError('[FR] GetFiscalizationParameters: ' + E.Message);
+              FLog.LogError('[FR] FNGetFiscalizationResult: ' + E.Message);
               if not FEmulation then
                 raise;
             end;
@@ -614,14 +620,16 @@ begin
       end;
 
       if Inn = '' then Inn := FEmulatedInn;
+      if KKTRegistrationNumber = '' then KKTRegistrationNumber := FEmulatedInn;
       if FnNumber = '' then FnNumber := FEmulatedFnNumber;
 
       Result := JsonOk(
         '"serialNumber":"' + JsonEscape(SerialNumber) + '",' +
-        '"inn":"' + JsonEscape(Inn) + '",' +
-        '"fnNumber":"' + JsonEscape(FnNumber) + '",' +
-        '"connected":' + BoolToStr(FConnected, True).ToLower + ',' +
-        '"emulation":' + BoolToStr(FEmulation, True).ToLower);
+        '"inn":"'       + JsonEscape(Inn) + '",' +
+        '"regNumber":"' + JsonEscape(KKTRegistrationNumber) + '",' +
+        '"fnNumber":"'  + JsonEscape(FnNumber) + '",' +
+        '"connected":'  + BoolToStr(FConnected, True).ToLower + ',' +
+        '"emulation":'  + BoolToStr(FEmulation, True).ToLower);
     except
       on E: Exception do
       begin
