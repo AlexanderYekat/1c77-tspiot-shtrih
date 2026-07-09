@@ -1,0 +1,32 @@
+{
+  "type": "sell",
+  "taxationType": "usnIncome",
+  "operator": {
+    "name": "Емельянов Алексей Андреевич"
+  },
+  "items": [
+    {
+      "type": "position",
+      "name": "Шлем неопреновый",
+      "price": 200.00,
+      "quantity": 1,
+      "department": 1,
+      "tax": { "type": "none" },
+      "paymentObject": "commodity",
+      "paymentMethod": "fullPayment",
+      "measurementUnit": "piece"
+    },
+    {
+      "type": "text",
+      "text": " "
+    },
+    {
+      "type": "text",
+      "text": "Код продавца 42"
+    }
+  ],
+  "payments": [
+    { "type": "electronically", "sum": 200.00 }
+  ],
+  "total": 200.00
+}
