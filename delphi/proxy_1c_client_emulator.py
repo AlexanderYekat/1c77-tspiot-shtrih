@@ -223,8 +223,8 @@ def run_smoke(client: Proxy1CClient, *, with_marking: bool) -> int:
     print(f"  Время HTTP: {fmt_duration(time.time() - started)}")
 
     started = time.time()
-    resp = client.kkt_post("/check-mark", sample_check_mark_payload(async_mode=False))
-    print_response("POST /kkt/check-mark", resp)
+    resp = client.kkt_post("/check-marks", sample_check_mark_payload(async_mode=False))
+    print_response("POST /kkt/check-marks", resp)
     if resp.status != 200 or not resp.ok:
         failed += 1
     print(f"  Время HTTP: {fmt_duration(time.time() - started)}")
@@ -278,13 +278,14 @@ def build_parser() -> argparse.ArgumentParser:
     print_check.add_argument("--json", help="Путь к JSON чека")
     print_check.add_argument("--with-marking", action="store_true")
 
-    check_mark = sub.add_parser("kkt-check-mark", help="POST /kkt/check-mark")
-    check_mark.add_argument("--async", dest="async_mode", action="store_true")
-    check_mark.add_argument("--cashier", default="")
-    check_mark.add_argument("--wait", type=int, default=180)
+    check_marks = sub.add_parser("kkt-check-marks", help="POST /kkt/check-marks")
+    check_marks.add_argument("--async", dest="async_mode", action="store_true")
+    check_marks.add_argument("--cashier", default="")
+    check_marks.add_argument("--wait", type=int, default=180)
+    check_marks.add_argument("--mark", default="")
 
-    status = sub.add_parser("kkt-check-mark-status", help="GET /kkt/check-mark/status")
-    status.add_argument("task_id")
+    status = sub.add_parser("kkt-check-marks-status", help="GET /kkt/check-marks/status")
+    status.add_argument("task_id", help="ID задания")
 
     sub.add_parser("kkt-close-shift", help="POST /kkt/close-shift")
     sub.add_parser("kkt-x-report", help="POST /kkt/x-report")
@@ -325,14 +326,14 @@ def main(argv: list[str] | None = None) -> int:
             print_response("POST /kkt/print-check", resp)
             return 0 if resp.status == 200 and resp.ok else 1
 
-        if args.command == "kkt-check-mark":
+        if args.command == "kkt-check-marks":
             payload = sample_check_mark_payload(
                 marks_raw=[args.mark],
                 async_mode=args.async_mode,
                 cashier_name=args.cashier,
             )
-            resp = client.kkt_post("/check-mark", payload)
-            print_response("POST /kkt/check-mark", resp)
+            resp = client.kkt_post("/check-marks", payload)
+            print_response("POST /kkt/check-marks", resp)
             if resp.status != 200 or not resp.ok:
                 return 1
             if args.async_mode and resp.json and resp.json.get("taskId"):
@@ -343,14 +344,14 @@ def main(argv: list[str] | None = None) -> int:
                     task_id,
                     timeout=args.wait,
                 )
-                print_response("GET /kkt/check-mark/status", final)
+                print_response("GET /kkt/check-marks/status", final)
                 return 0 if final.ok else 1
             return 0
 
-        if args.command == "kkt-check-mark-status":
+        if args.command == "kkt-check-marks-status":
             query = urllib.parse.urlencode({"taskId": args.task_id})
-            resp = client.kkt_get(f"/check-mark/status?{query}")
-            print_response("GET /kkt/check-mark/status", resp)
+            resp = client.kkt_get(f"/check-marks/status?{query}")
+            print_response("GET /kkt/check-marks/status", resp)
             return 0 if resp.status == 200 and resp.ok else 1
 
         if args.command == "kkt-close-shift":
@@ -383,7 +384,7 @@ class _KktStatusClient:
 
     def check_mark_status(self, task_id: str) -> HttpResponse:
         query = urllib.parse.urlencode({"taskId": task_id})
-        return self._proxy.kkt_get(f"/check-mark/status?{query}")
+        return self._proxy.kkt_get(f"/check-marks/status?{query}")
 
 
 if __name__ == "__main__":

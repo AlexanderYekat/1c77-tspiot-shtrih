@@ -149,13 +149,13 @@ begin
       ResultJson := FVariantPrint.DisconnectJson;
       WriteJson(AResponseInfo, ResultJson);
     end
-    else if (Method = 'POST') and (Path = '/check-mark') then
+    else if (Method = 'POST') and (Path = '/check-marks') then
     begin
       Body := ReadBody(ARequestInfo);
       ResultJson := FVariantPrint.CheckMarkJson(Body);
       WriteJson(AResponseInfo, ResultJson);
     end
-    else if (Method = 'GET') and (Path = '/check-mark/status') then
+    else if (Method = 'GET') and (Path = '/check-marks/status') then
     begin
       ResultJson := FVariantPrint.CheckMarkStatusJson(ARequestInfo.Params.Values['taskId']);
       WriteJson(AResponseInfo, ResultJson);

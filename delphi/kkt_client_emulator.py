@@ -10,8 +10,8 @@
   POST /x-report
   POST /cancel-check
   POST /disconnect
-  POST /check-mark
-  GET  /check-mark/status?taskId=...
+  POST /check-marks
+  GET  /check-marks/status?taskId=...
 
 Примеры:
   python kkt_client_emulator.py info
@@ -130,12 +130,12 @@ class KktServerClient:
     def disconnect(self) -> HttpResponse:
         return self.request("POST", "/disconnect")
 
-    def check_mark(self, payload: dict[str, Any]) -> HttpResponse:
-        return self.request("POST", "/check-mark", payload)
+    def check_marks(self, payload: dict[str, Any]) -> HttpResponse:
+        return self.request("POST", "/check-marks", payload)
 
-    def check_mark_status(self, task_id: str) -> HttpResponse:
+    def check_marks_status(self, task_id: str) -> HttpResponse:
         query = urllib.parse.urlencode({"taskId": task_id})
-        return self.request("GET", f"/check-mark/status?{query}")
+        return self.request("GET", f"/check-marks/status?{query}")
 
 
 def sample_receipt(
@@ -325,20 +325,20 @@ def check_mark_response_all_accepted(resp: HttpResponse) -> bool:
 def run_check_mark_sync(
     client: KktServerClient,
     *,
-    mark_raw: str,
+    marks_raw: list[str],
     label: str,
 ) -> tuple[HttpResponse, float]:
-    """POST /check-mark (sync), возвращает ответ и длительность HTTP."""
-    payload = sample_check_mark_payload(marks_raw=[mark_raw], async_mode=False)
+    """POST /check-marks (sync), возвращает ответ и длительность HTTP."""
+    payload = sample_check_mark_payload(marks_raw=marks_raw, async_mode=False)
     started = time.time()
-    resp = client.check_mark(payload)
+    resp = client.check_marks(payload)
     elapsed = time.time() - started
     print_response(label, resp)
     print(f"  Время HTTP: {fmt_duration(elapsed)}")
-    if check_mark_response_cached(resp):
+    if check_marks_response_cached(resp):
         print("  -> марка из кэша сервера (OK cached)")
     return resp, elapsed
-
+    
 
 def run_mark_cache_test(
     client: KktServerClient,
@@ -395,8 +395,8 @@ def _scenario_cache_check_then_print(
     password: int,
     mark_raw: str,
 ) -> int:
-    """check-mark → print-check без markAccepted (ленивый клиент)."""
-    print("СЦЕНАРИЙ: check-mark, затем print-check без markAccepted")
+    """check-marks → print-check без markAccepted (ленивый клиент)."""
+    print("СЦЕНАРИЙ: check-marks, затем print-check без markAccepted")
     print("  Ожидание: печать использует кэш, полный цикл FNCheckItemBarcode не повторяется.\n")
 
     failed = 0

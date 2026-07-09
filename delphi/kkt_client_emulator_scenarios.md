@@ -41,7 +41,7 @@ python kkt_client_emulator.py info
 |----------|----------|
 | `--json` | Путь к файлу чека (если не указан — встроенный тестовый чек) |
 | `--with-marking` | Добавить маркированную позицию (`mark` в base64) |
-| `--mark-accepted` | Для марки: `markAccepted=true` (марка уже проверена через `/check-mark`) |
+| `--mark-accepted` | Для марки: `markAccepted=true` (марка уже проверена через `/check-marks`) |
 | `--sell-return` | Чек возврата: `type=sellReturn` |
 
 ```bash
@@ -54,9 +54,9 @@ python kkt_client_emulator.py print-check --json sample-json-check.json
 
 ---
 
-### `check-mark`
+### `check-marks`
 
-**Endpoint:** `POST /check-mark` (+ при `--async`: `GET /check-mark/status`)
+**Endpoint:** `POST /check-marks` (+ при `--async`: `GET /check-marks/status`)
 
 Проверка одной или нескольких марок на ККТ.
 
@@ -70,22 +70,22 @@ python kkt_client_emulator.py print-check --json sample-json-check.json
 | `--wait` | Таймаут ожидания async-задачи, сек (по умолчанию `180`) |
 
 ```bash
-python kkt_client_emulator.py check-mark
-python kkt_client_emulator.py check-mark --mark "010460406000301021N4N57RDCUDVTL"
-python kkt_client_emulator.py check-mark --async
-python kkt_client_emulator.py check-mark --sell-return --cashier "Иванов"
+python kkt_client_emulator.py check-marks
+python kkt_client_emulator.py check-marks --mark "010460406000301021N4N57RDCUDVTL"
+python kkt_client_emulator.py check-marks --async
+python kkt_client_emulator.py check-marks --sell-return --cashier "Иванов"
 ```
 
 ---
 
-### `check-mark-status`
+### `check-marks-status`
 
-**Endpoint:** `GET /check-mark/status?taskId=...`
+**Endpoint:** `GET /check-marks/status?taskId=...`
 
 Статус асинхронной проверки марки.
 
 ```bash
-python kkt_client_emulator.py check-mark-status <taskId>
+python kkt_client_emulator.py check-marks-status <taskId>
 ```
 
 ---
@@ -183,14 +183,14 @@ python kkt_client_emulator.py queue-test --scenario mixed
 
 #### `sync-chain` (сценарий 1)
 
-N синхронных `POST /check-mark` **подряд** из одного потока.
+N синхронных `POST /check-marks` **подряд** из одного потока.
 
 - Каждый HTTP-запрос блокируется до полного ответа ККТ.
 - Показывает суммарное время цепочки.
 
 #### `async-burst` (сценарий 2)
 
-N async `POST /check-mark` **почти одновременно** (разные потоки).
+N async `POST /check-marks` **почти одновременно** (разные потоки).
 
 - HTTP-ответ с `taskId` приходит быстро (миллисекунды).
 - Полное завершение на ККТ — последовательно, с большим разбросом по времени.
@@ -200,8 +200,8 @@ N async `POST /check-mark` **почти одновременно** (разные
 
 Смешанная нагрузка:
 
-1. `max(2, count // 2)` async `check-mark` (параллельный старт)
-2. Сразу sync `check-mark`
+1. `max(2, count // 2)` async `check-marks` (параллельный старт)
+2. Сразу sync `check-marks`
 3. Сразу sync `print-check`
 4. Ожидание завершения всех async-задач
 
@@ -218,7 +218,7 @@ N async `POST /check-mark` **почти одновременно** (разные
 Для каждого шага:
 
 ```
-[11:05:01.234 -> 11:05:01.245] async check-mark #1 (async-mark-0): HTTP 11 мс, taskId=a1b2c3d4..., полное 4.52 с -> OK
+[11:05:01.234 -> 11:05:01.245] async check-marks #1 (async-mark-0): HTTP 11 мс, taskId=a1b2c3d4..., полное 4.52 с -> OK
 ```
 
 | Поле | Значение |
@@ -235,8 +235,8 @@ N async `POST /check-mark` **почти одновременно** (разные
 |-------|------|
 | GET | `/info` |
 | POST | `/print-check` |
-| POST | `/check-mark` |
-| GET | `/check-mark/status?taskId=...` |
+| POST | `/check-marks` |
+| GET | `/check-marks/status?taskId=...` |
 | POST | `/close-shift` |
 | POST | `/x-report` |
 | POST | `/cancel-check` |
