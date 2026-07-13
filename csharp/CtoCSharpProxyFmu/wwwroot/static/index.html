@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ЦТО КСМ - Настройки прокси-сервиса ver. 2024.10.28</title>
+    <meta charset="UTF-8">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 20px auto;
+            padding: 0 20px;
+        }
+        .settings-form {
+            background: #f5f5f5;
+            padding: 20px;
+            border-radius: 5px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="text"], input[type="number"] {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        button {
+            background: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        .status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .success {
+            background: #dff0d8;
+            color: #3c763d;
+        }
+        .error {
+            background: #f2dede;
+            color: #a94442;
+        }
+        .status.restart {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeeba;
+            font-weight: bold;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .logo {
+            max-width: 200px;
+            margin-bottom: 10px;
+        }
+        .company-info {
+            margin-top: 20px;
+            text-align: center;
+            color: #666;
+            padding: 20px;
+            border-top: 1px solid #eee;
+        }
+        .company-info a {
+            color: #4CAF50;
+            text-decoration: none;
+        }
+        .company-info a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <a href="https://cto-ksm.ru" target="_blank">
+            <img src="logo.png" alt="ЦТО КСМ" class="logo">
+        </a>
+        <h1>Настройки прокси-сервиса для FMU (разрешительный режим)</h1>
+    </div>
+    <div class="settings-form">
+        <div class="form-group">
+            <label for="sourcePort">Порт для 1cv77:</label>
+            <input type="number" id="sourcePort" value="2579">
+        </div>
+        <div class="form-group">
+            <label for="targetPort">Порт для FMU:</label>
+            <input type="number" id="targetPort" value="2578">
+        </div>
+        <div class="form-group">
+            <label for="targetHost">IP адрес сервера FMU:</label>
+            <input type="text" id="targetHost" value="localhost">
+        </div>
+        <button onclick="saveSettings()">Сохранить настройки</button>
+        <div id="status" class="status" style="display: none;"></div>
+    </div>
+
+    <div class="company-info">
+        <p>© 2024 ЦТО КСМ - Центр технического обслуживания контрольно-слежящей механики</p>
+        <p>Посетите наш сайт: <a href="https://cto-ksm.ru" target="_blank">cto-ksm.ru</a></p>
+    </div>
+
+    <script>
+        function showStatus(message, isError = false) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.style.display = 'block';
+            status.className = 'status ' + (isError ? 'error' : 'success');
+            
+            // Если это сообщение о перезапуске, добавим дополнительную информацию
+            if (message.includes("restart")) {
+                setTimeout(() => {
+                    showStatus("Waiting for service restart... Page will reload in 5 seconds");
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 5000);
+                }, 2000);
+            }
+        }
+
+        async function loadSettings() {
+            try {
+                const response = await fetch('/api/settings');
+                const settings = await response.json();
+                document.getElementById('sourcePort').value = settings.sourcePort;
+                document.getElementById('targetPort').value = settings.targetPort;
+                document.getElementById('targetHost').value = settings.targetHost;
+            } catch (error) {
+                showStatus('Failed to load settings: ' + error.message, true);
+            }
+        }
+
+        async function saveSettings() {
+            const settings = {
+                sourcePort: parseInt(document.getElementById('sourcePort').value),
+                targetPort: parseInt(document.getElementById('targetPort').value),
+                targetHost: document.getElementById('targetHost').value
+            };
+
+            try {
+                const response = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(settings)
+                });
+
+                const message = await response.text();
+                if (response.ok) {
+                    showStatus(message);
+                    // После сохранения настроек и перезапуска службы
+                    // страница автоматически перезагрузится через 5 секунд
+                } else {
+                    showStatus('Failed to save settings: ' + message, true);
+                }
+            } catch (error) {
+                showStatus('Error: ' + error.message, true);
+            }
+        }
+
+        // Load settings when page loads
+        loadSettings();
+    </script>
+</body>
+</html>
