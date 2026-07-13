@@ -22,6 +22,7 @@ type
     seFrPassword: TSpinEdit;
     gbKKT: TGroupBox;
     chkEmulation: TCheckBox;
+    chkTestReceiptMode: TCheckBox;
     pnlEmulation: TPanel;
     lblEmulatedSerial: TLabel;
     edEmulatedSerial: TEdit;
@@ -144,6 +145,7 @@ begin
   seFrPassword.Value := FSettings.ReadInteger('FRCash', 'Password', DefaultFrPassword);
 
   chkEmulation.Checked := FSettings.ReadBool('KKT', 'Emulation', False);
+  chkTestReceiptMode.Checked := FSettings.ReadBool('KKT', 'TestReceiptMode', False);
   edEmulatedSerial.Text := FSettings.ReadString('KKT', 'EmulatedSerial', '0000000000000001');
   edEmulatedInn.Text := FSettings.ReadString('KKT', 'EmulatedInn', '1234567890');
   edEmulatedFnNumber.Text := FSettings.ReadString('KKT', 'EmulatedFnNumber', '9999078900000001');
@@ -175,6 +177,7 @@ begin
   FSettings.WriteInteger('FRCash', 'Password', seFrPassword.Value);
 
   FSettings.WriteBool('KKT', 'Emulation', chkEmulation.Checked);
+  FSettings.WriteBool('KKT', 'TestReceiptMode', chkTestReceiptMode.Checked);
   FSettings.WriteString('KKT', 'EmulatedSerial', Trim(edEmulatedSerial.Text));
   FSettings.WriteString('KKT', 'EmulatedInn', Trim(edEmulatedInn.Text));
   FSettings.WriteString('KKT', 'EmulatedFnNumber', Trim(edEmulatedFnNumber.Text));

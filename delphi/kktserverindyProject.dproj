@@ -103,6 +103,14 @@
     <PropertyGroup Condition="'$(Cfg_1_Win32)'!=''">
         <DCC_RemoteDebug>false</DCC_RemoteDebug>
         <AppDPIAwarenessMode>PerMonitorV2</AppDPIAwarenessMode>
+        <VerInfo_IncludeVerInfo>true</VerInfo_IncludeVerInfo>
+        <VerInfo_MajorVer>2026</VerInfo_MajorVer>
+        <VerInfo_MinorVer>7</VerInfo_MinorVer>
+        <VerInfo_Release>12</VerInfo_Release>
+        <VerInfo_Build>3</VerInfo_Build>
+        <VerInfo_Locale>1049</VerInfo_Locale>
+        <VerInfo_Keys>CompanyName=;FileDescription=$(MSBuildProjectName);FileVersion=2026.7.12.3;InternalName=;LegalCopyright=;LegalTrademarks=;OriginalFilename=;ProgramID=com.embarcadero.$(MSBuildProjectName);ProductName=$(MSBuildProjectName);ProductVersion=1.0.0.0;Comments=</VerInfo_Keys>
+        <VerInfo_AutoIncVersion>true</VerInfo_AutoIncVersion>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Cfg_1_Win64)'!=''">
         <AppDPIAwarenessMode>PerMonitorV2</AppDPIAwarenessMode>
@@ -124,13 +132,16 @@
             <MainSource>MainSource</MainSource>
         </DelphiCompile>
         <DCCReference Include="kktserverindy.pas">
-            <Form>Form3</Form>
+            <Form>kktServerIndyForm</Form>
             <FormType>dfm</FormType>
         </DCCReference>
         <DCCReference Include="uFormSettings.pas">
             <Form>FormSettings</Form>
             <FormType>dfm</FormType>
         </DCCReference>
+        <DCCReference Include="uHttpServerFmu.pas"/>
+        <DCCReference Include="uVariantPrint.pas"/>
+        <DCCReference Include="uKktLog.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>
@@ -151,6 +162,10 @@
                 <Source>
                     <Source Name="MainSource">kktserverindyProject.dpr</Source>
                 </Source>
+                <Excluded_Packages>
+                    <Excluded_Packages Name="$(BDSBIN)\dcloffice2k290.bpl">Microsoft Office 2000 Sample Automation Server Wrapper Components</Excluded_Packages>
+                    <Excluded_Packages Name="$(BDSBIN)\dclofficexp290.bpl">Microsoft Office XP Sample Automation Server Wrapper Components</Excluded_Packages>
+                </Excluded_Packages>
             </Delphi.Personality>
             <Deployment Version="4">
                 <DeployFile LocalName="Win32\Debug\kktserverindyProject.exe" Configuration="Debug" Class="ProjectOutput">

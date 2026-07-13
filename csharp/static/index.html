@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>ЦТО КСМ - Настройки прокси-сервиса ver. 2024.10.28</title>
+    <title>ЦТО КСМ - Настройки прокси-сервиса</title>
     <meta charset="UTF-8">
     <style>
         body {
@@ -63,6 +63,11 @@
             text-align: center;
             margin-bottom: 30px;
         }
+        .version-info {
+            margin-top: 8px;
+            color: #666;
+            font-size: 14px;
+        }
         .logo {
             max-width: 200px;
             margin-bottom: 10px;
@@ -99,6 +104,7 @@
             <img src="logo.png" alt="ЦТО КСМ" class="logo">
         </a>
         <h1>Настройки прокси-сервиса FMU и KKT</h1>
+        <p id="versionInfo" class="version-info">Загрузка версий...</p>
     </div>
     <div class="settings-form">
         <div class="form-group">
@@ -151,6 +157,22 @@
             }
         }
 
+        async function loadVersionInfo() {
+            const versionInfo = document.getElementById('versionInfo');
+            try {
+                const response = await fetch('/health');
+                const health = await response.json();
+                const proxyVersion = health.version || '—';
+                const kktVersion = health.kkt && health.kkt.version ? health.kkt.version : '—';
+                const kktStatus = health.kkt && health.kkt.reachable ? 'доступен' : 'недоступен';
+                versionInfo.textContent =
+                    `Прокси: v${proxyVersion}; Delphi (KKT): v${kktVersion} (${kktStatus})`;
+                document.title = `ЦТО КСМ - Настройки прокси-сервиса v${proxyVersion}`;
+            } catch (error) {
+                versionInfo.textContent = 'Не удалось получить версии служб';
+            }
+        }
+
         async function loadSettings() {
             try {
                 const response = await fetch('/api/settings');
@@ -197,6 +219,7 @@
         }
 
         // Load settings when page loads
+        loadVersionInfo();
         loadSettings();
 
         // WebSocket для логов

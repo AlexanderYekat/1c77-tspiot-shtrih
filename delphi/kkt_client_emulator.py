@@ -4,6 +4,7 @@
 Эмулятор HTTP-клиента для Delphi KKT-сервера (kktserverindy).
 
 Сервер по умолчанию слушает порт 2580 и предоставляет endpoints:
+  GET  /health
   GET  /info
   POST /print-check
   POST /close-shift
@@ -14,6 +15,7 @@
   GET  /check-marks/status?taskId=...
 
 Примеры:
+  python kkt_client_emulator.py health
   python kkt_client_emulator.py info
   python kkt_client_emulator.py smoke
   python kkt_client_emulator.py print-check --json receipt.json
@@ -111,6 +113,9 @@ class KktServerClient:
             parsed = None
 
         return HttpResponse(status=status, body=raw, json=parsed)
+
+    def health(self) -> HttpResponse:
+        return self.request("GET", "/health")
 
     def info(self) -> HttpResponse:
         return self.request("GET", "/info")
@@ -879,6 +884,7 @@ def run_smoke_test(client: KktServerClient, password: int, with_marking: bool) -
     """Последовательная проверка всех основных endpoints."""
     steps: list[tuple[str, HttpResponse]] = []
 
+    steps.append(("GET /health", client.health()))
     steps.append(("GET /info", client.info()))
     steps.append(
         (
@@ -921,6 +927,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
+    sub.add_parser("health", help="GET /health — проверка доступности сервера")
     sub.add_parser("info", help="GET /info — информация о ККТ")
 
     print_cmd = sub.add_parser("print-check", help="POST /print-check — печать чека")
@@ -1036,6 +1043,11 @@ def main(argv: list[str] | None = None) -> int:
     client = KktServerClient(host=args.host, port=args.port, timeout=args.timeout)
 
     try:
+        if args.command == "health":
+            resp = client.health()
+            print_response("GET /health", resp)
+            return 0 if resp.ok else 1
+
         if args.command == "info":
             print_response("GET /info", client.info())
             return 0

@@ -121,7 +121,7 @@ object FormSettings: TFormSettings
       Left = 0
       Top = 162
       Width = 447
-      Height = 201
+      Height = 221
       Align = alTop
       Caption = ' '#1069#1084#1091#1083#1103#1094#1080#1103' '#1050#1050#1058' '
       TabOrder = 2
@@ -134,9 +134,17 @@ object FormSettings: TFormSettings
         TabOrder = 0
         OnClick = chkEmulationClick
       end
+      object chkTestReceiptMode: TCheckBox
+        Left = 16
+        Top = 40
+        Width = 409
+        Height = 17
+        Caption = #1058#1077#1089#1090#1086#1074#1099#1081' '#1088#1077#1078#1080#1084' '#1095#1077#1082#1072' ('#1086#1090#1084#1077#1085#1072' '#1074#1084#1077#1089#1090#1086' '#1079#1072#1082#1088#1099#1090#1080#1103')'
+        TabOrder = 2
+      end
       object pnlEmulation: TPanel
         Left = 8
-        Top = 43
+        Top = 63
         Width = 432
         Height = 150
         BevelOuter = bvNone

@@ -13,7 +13,9 @@ type
     ButtonStopServer: TButton;
     LogsMemo: TMemo;
     HeaderLabel: TLabel;
+    VersionLabel: TLabel;
     OptionsButton: TButton;
+    procedure FormCreate(Sender: TObject);
     procedure ButtonStartServerClick(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure ButtonStopServerClick(Sender: TObject);
@@ -40,6 +42,11 @@ var
 implementation
 
 {$R *.dfm}
+
+procedure TkktServerIndyForm.FormCreate(Sender: TObject);
+begin
+  VersionLabel.Caption := 'Версия: ' + TFmuHttpServer.ReadExeFileVersion;
+end;
 
 procedure TkktServerIndyForm.AppendLogLine(const Line: string);
 begin

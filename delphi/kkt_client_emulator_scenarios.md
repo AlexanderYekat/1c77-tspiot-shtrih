@@ -19,7 +19,21 @@ HTTP-клиент для Delphi KKT-сервера (`kktserverindy`).
 
 ## Команды (одиночные сценарии)
 
-### `info`
+### `health`
+
+**Endpoint:** `GET /health`
+
+Быстрая проверка, что HTTP-сервис запущен и отвечает (без обращения к ККТ, в отличие от `/info`).
+
+```bash
+python kkt_client_emulator.py health
+```
+
+Ожидаемый ответ: `result=1`, `status=up`, `service=kktserverindy`, `version=...`.
+
+---
+
+## `info`
 
 **Endpoint:** `GET /info`
 
@@ -143,7 +157,8 @@ python kkt_client_emulator.py disconnect
 
 Последовательный прогон основных endpoints в одной сессии:
 
-1. `GET /info`
+1. `GET /health`
+2. `GET /info`
 2. `POST /print-check`
 3. `POST /x-report`
 4. `POST /cancel-check`
@@ -233,6 +248,7 @@ N async `POST /check-marks` **почти одновременно** (разны�
 
 | Метод | Путь |
 |-------|------|
+| GET | `/health` |
 | GET | `/info` |
 | POST | `/print-check` |
 | POST | `/check-marks` |

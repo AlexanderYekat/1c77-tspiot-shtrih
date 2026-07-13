@@ -25,6 +25,7 @@ type
     FAcceptedMarks: TDictionary<string, Byte>; // принятые марки в рамках текущего чека
     FConnected: Boolean;       // текущее состояние соединения, как мы его понимаем
     FEmulation: Boolean;
+    FTestReceiptMode: Boolean; // тестовый режим: CancelCheck вместо FNCloseCheckEx
 
     FEmulatedSerial: string;
     FEmulatedInn: string;
@@ -41,10 +42,11 @@ type
     function ReadCheckNumberAfterClose: Integer;
     function ReadSessionNumberAfterClose: Integer;
     function FRObjectReady: Boolean;
+    procedure RunFR(const Place: string; const Proc: TProc);
     procedure LogFRSkipped(const Place: string);
 
     procedure SendIndustryRequisite126x(const Tag1262, Tag1263, Tag1264, UUID,
-      TimeStr: string);
+      TimeStr, Inst, Version: string);
     procedure SendMarkingCodeAfterFNOperation(const MarkKkt: string);
     procedure ProcessMarkingAfterFNOperation(const MarkDecoded: string;
       MarkAccepted, ReturnCheck: Boolean);
@@ -71,16 +73,29 @@ type
     function IsMarkAcceptedInCache(const MarkDecoded: string; ReturnCheck: Boolean): Boolean;
     procedure AddMarkToAcceptedCache(const MarkDecoded: string; ReturnCheck: Boolean);
     procedure ClearAcceptedMarksCache;
+
+    procedure ReadInnAndFn(out Inn, FnNumber: string);
+    function ResolvePermissionInn(Req: TJSONObject): string;
+    function ResolvePermissionFn(Req: TJSONObject): string;
+    function BuildDocumentCheckJson(const MarkB64, Inn, Fn: string): string;
+    function HttpPostJson(const Url, Body: string): string;
+    function ExtractFirstTruemarkCode(Truemark: TJSONObject): TJSONObject;
+    procedure AddTruemarkFields(PermObj, Truemark: TJSONObject);
+    function ParsePermissionCheckResponse(const ResponseBody: string): TJSONObject;
+    function CheckSingleMarkPermission(const MarkB64, Inn, Fn: string): TJSONObject;
   public
     constructor Create(ASettings: TCustomIniFile);
     destructor Destroy; override;
 
     function KktInfoJson: string;
+    function KktConnectionStatusJson: string;
     function PrintCheckJson(const Body: string): string;
     function CloseShiftJson(const Body: string): string;
     function XReportJson(const Body: string = ''): string;
     function CancelCheckJson(const Body: string = ''): string;
     function DisconnectJson: string;
+    function ConnectJson: string;
+    function ClearBufferOfMarksJson(const Body: string = ''): string;
     function CheckMarkJson(const Body: string): string;
     function CheckMarkStatusJson(const TaskId: string): string;
 
@@ -89,6 +104,14 @@ type
   end;
 
 implementation
+
+uses
+  IdHTTP;
+
+const
+  PERMISSION_FMU_HOST = 'localhost';
+  PERMISSION_FMU_PORT = 2578;
+  PERMISSION_FMU_PATH = '/document';
 
 {-------------------------------------------------------------------------------
  Вспомогательные функции уровня модуля
@@ -104,6 +127,60 @@ begin
              .Replace(#29, '\u001D');
 end;
 
+function UnescapeJsonUnicode(const S: string): string;
+var
+  I, Code: Integer;
+  Hex: string;
+begin
+  Result := '';
+  I := 1;
+  while I <= Length(S) do
+  begin
+    if (I + 5 <= Length(S)) and (S[I] = '\') and (UpCase(S[I + 1]) = 'U') then
+    begin
+      Hex := Copy(S, I + 2, 4);
+      if TryStrToInt('$' + Hex, Code) then
+      begin
+        Result := Result + WideChar(Code);
+        Inc(I, 6);
+        Continue;
+      end;
+    end;
+    Result := Result + S[I];
+    Inc(I);
+  end;
+end;
+
+function JsonToPlainText(const V: TJSONAncestor): string;
+begin
+  // ToJSON в старых Delphi экранирует кириллицу как \uXXXX; раскодируем для 1С 7.7 и логов.
+  Result := UnescapeJsonUnicode(V.ToJSON);
+end;
+
+function JsonBodyPreviewPlain(const Body: string; MaxLen: Integer = 300): string;
+var
+  Parsed: TJSONValue;
+begin
+  Result := Body;
+  Parsed := TJSONObject.ParseJSONValue(Body);
+  if Parsed = nil then
+  begin
+    if Length(Result) > MaxLen then
+      Result := Copy(Result, 1, MaxLen) + '...';
+    Exit;
+  end;
+  try
+    if Parsed is TJSONAncestor then
+      Result := JsonToPlainText(TJSONAncestor(Parsed))
+    else
+      Result := UnescapeJsonUnicode(Parsed.ToJSON);
+  finally
+    Parsed.Free;
+  end;
+  if Length(Result) > MaxLen then
+    Result := Copy(Result, 1, MaxLen) + '...';
+end;
+
 function JsonOk(const Extra: string = ''): string;
 begin
   Result := '{"result":1,"description":"OK"';
@@ -115,6 +192,33 @@ end;
 function JsonError(const Msg: string): string;
 begin
   Result := '{"result":0,"description":"' + JsonEscape(Msg) + '"}';
+end;
+
+function JsonBodyPreview(const Body: string; MaxLen: Integer = 300): string;
+begin
+  Result := Body;
+  if Length(Result) > MaxLen then
+    Result := Copy(Result, 1, MaxLen) + '...';
+end;
+
+function ParseJsonObjectOrRaise(const Body: string; const LogPrefix: string;
+  ALog: TKktLogger): TJSONObject;
+var
+  V: TJSONValue;
+begin
+  if Trim(Body) = '' then
+    raise Exception.Create('Empty request body');
+  V := TJSONObject.ParseJSONValue(Body);
+  if not (V is TJSONObject) then
+  begin
+    if Assigned(ALog) then
+      ALog.LogError(Format('%s: Invalid JSON, bodyLen=%d, head=%s',
+        [LogPrefix, Length(Body), JsonBodyPreview(Body)]));
+    if V <> nil then
+      V.Free;
+    raise Exception.Create(Format('Invalid JSON, bodyLen=%d', [Length(Body)]));
+  end;
+  Result := TJSONObject(V);
 end;
 
 function JStr(O: TJSONObject; const Name: string; const Def: string = ''): string;
@@ -203,6 +307,11 @@ begin
   else if SameText(Obj, 'agentCommission') then Result := 12
   else if SameText(Obj, 'composite') then Result := 14
   else if SameText(Obj, 'another') then Result := 14
+  else if SameText(Obj, 'exciseWithoutMarking') then Result := 30
+  else if SameText(Obj, 'exciseWithMarking') then Result := 31
+  else if SameText(Obj, 'commodityWithoutMarking') then Result := 32
+  else if SameText(Obj, 'commodityWithMarking') then Result := 33
+
   else Result := 1;
 end;
 
@@ -222,6 +331,8 @@ function MapMeasureUnit(const U: string): Integer;
 begin
   if SameText(U, 'piece') or SameText(U, #1096#1090) then
     Result := 0
+  else if SameText(U, 'liter') then
+    Result := 41
   else
     Result := 0;
 end;
@@ -252,6 +363,7 @@ begin
   FConnected := False;
 
   FEmulation := FSettings.ReadBool('KKT', 'Emulation', False);
+  FTestReceiptMode := FSettings.ReadBool('KKT', 'TestReceiptMode', False);
   FEmulatedSerial := FSettings.ReadString('KKT', 'EmulatedSerial', '0000000000000001');
   FEmulatedInn := FSettings.ReadString('KKT', 'EmulatedInn', '1234567890');
   FEmulatedRegNumber := FSettings.ReadString('KKT', 'EmulatedRegNumber', '1234567111890');
@@ -263,6 +375,8 @@ begin
     FLog.LogInfo('Режим эмуляции ККТ включён — команды ovObject выполняются, ошибки логируются, ответ API = OK')
   else
     FLog.LogInfo('Боевой режим ККТ');
+  if FTestReceiptMode then
+    FLog.LogInfo('Тестовый режим чека: вместо FNCloseCheckEx будет CancelCheck');
 end;
 
 destructor TVariantPrint.Destroy;
@@ -317,19 +431,20 @@ end;
 
 function TVariantPrint.ReadSerialNumber: string;
 begin
-  Result := FEmulatedSerial;
+  Result:='';
+  if FEmulation then begin
+    Result := FEmulatedSerial;
+    Exit;
+  end;
   if VarIsEmpty(ovObject) or VarIsNull(ovObject) then
     Exit;
 
   try
     Result := VarToStr(ovObject.SerialNumber);
-    if Result = '' then
-      Result := FEmulatedSerial;
   except
     on E: Exception do
     begin
       FLog.LogError('[FR] ReadSerialNumber: ' + E.Message);
-      Result := FEmulatedSerial;
     end;
   end;
 end;
@@ -337,6 +452,19 @@ end;
 function TVariantPrint.FRObjectReady: Boolean;
 begin
   Result := not (VarIsEmpty(ovObject) or VarIsNull(ovObject));
+end;
+
+procedure TVariantPrint.RunFR(const Place: string; const Proc: TProc);
+begin
+  if FEmulation then
+  begin
+    FLog.LogInfo('[FR] ' + Place + ' (emu)');
+    Exit;
+  end;
+  if not FRObjectReady then
+    LogFRSkipped(Place);
+  Proc();
+  CheckFRResult(Place);
 end;
 
 procedure TVariantPrint.LogFRSkipped(const Place: string);
@@ -349,19 +477,20 @@ end;
 function TVariantPrint.ReadCheckNumberAfterClose: Integer;
 begin
   Result := 0;
-  if VarIsEmpty(ovObject) or VarIsNull(ovObject) then
+  RunFR('GetECRStatus after close', procedure
   begin
-    if FEmulation then
-    begin
-      Inc(FEmulatedCheckNumber);
-      Result := FEmulatedCheckNumber;
-    end;
+    ovObject.GetECRStatus;
+  end);
+  if FEmulation then
+  begin
+    Inc(FEmulatedCheckNumber);
+    Result := FEmulatedCheckNumber;
     Exit;
   end;
+  if not FRObjectReady then
+    Exit;
 
   try
-    ovObject.GetECRStatus;
-    CheckFRResult('GetECRStatus after close');
     Result := ovObject.OpenDocumentNumber;
     try
       if ovObject.ECRAdvancedMode = 5 then
@@ -372,34 +501,28 @@ begin
     on E: Exception do
     begin
       FLog.LogError('[FR] ReadCheckNumberAfterClose: ' + E.Message);
-      if not FEmulation then
-        raise;
+      raise;
     end;
-  end;
-
-  if FEmulation and (Result <= 0) then
-  begin
-    Inc(FEmulatedCheckNumber);
-    Result := FEmulatedCheckNumber;
   end;
 end;
 
 function TVariantPrint.ReadSessionNumberAfterClose: Integer;
 begin
   Result := 0;
-  if VarIsEmpty(ovObject) or VarIsNull(ovObject) then
+  RunFR('GetECRStatus after close shift', procedure
   begin
-    if FEmulation then
-    begin
-      Inc(FEmulatedSessionNumber);
-      Result := FEmulatedSessionNumber;
-    end;
+    ovObject.GetECRStatus;
+  end);
+  if FEmulation then
+  begin
+    Inc(FEmulatedSessionNumber);
+    Result := FEmulatedSessionNumber;
     Exit;
   end;
+  if not FRObjectReady then
+    Exit;
 
   try
-    ovObject.GetECRStatus;
-    CheckFRResult('GetECRStatus after close shift');
     Result := ovObject.SessionNumber;
     try
       if ovObject.ECRAdvancedMode = 5 then
@@ -410,15 +533,8 @@ begin
     on E: Exception do
     begin
       FLog.LogError('[FR] ReadSessionNumberAfterClose: ' + E.Message);
-      if not FEmulation then
-        raise;
+      raise;
     end;
-  end;
-
-  if FEmulation and (Result <= 0) then
-  begin
-    Inc(FEmulatedSessionNumber);
-    Result := FEmulatedSessionNumber;
   end;
 end;
 
@@ -432,7 +548,7 @@ begin
   if not FConnected then
     Exit;
 
-  if FEmulation and (VarIsEmpty(ovObject) or VarIsNull(ovObject)) then
+  if FEmulation then
   begin
     Result := True;
     Exit;
@@ -442,17 +558,12 @@ begin
     Exit;
 
   try
-    ovObject.GetECRStatus;
-    CheckFRResult('CheckLinkAlive GetECRStatus');
-    Result := True;
+    Result := ovObject.Connected;
   except
     on E: Exception do
     begin
       FLog.LogError('[FR] CheckLinkAlive: ' + E.Message);
-      if FEmulation then
-        Result := True
-      else
-        Result := False;
+      Result := False;
     end;
   end;
 end;
@@ -492,29 +603,16 @@ begin
   ComPort := FSettings.ReadInteger('FRCash', 'Port', 1);
   Baud := FSettings.ReadInteger('FRCash', 'Baud', 6);
   Password := FSettings.ReadInteger('FRCash', 'Password', 30);
-  ovObject.ComNumber := ComPort;
-  ovObject.BaudRate := Baud;
-  ovObject.Password := Password;
 
   FLog.LogInfo(Format('[FR] Connect ComNumber=%d BaudRate=%d', [ComPort, Baud]));
 
-  try
+  RunFR('Connect', procedure
+  begin
+    ovObject.ComNumber := ComPort;
+    ovObject.BaudRate := Baud;
+    ovObject.Password := Password;
     ovObject.Connect;
-    CheckFRResult('Connect');
-  except
-    on E: Exception do
-    begin
-      FLog.LogError('[FR] Connect exception: ' + E.Message);
-      if FEmulation then
-      begin
-        FConnected := True;
-        Result := True;
-        Exit;
-      end;
-      FConnected := False;
-      raise;
-    end;
-  end;
+  end);
 
   FConnected := True;
   Result := True;
@@ -522,20 +620,11 @@ end;
 
 procedure TVariantPrint.DoDisconnect;
 begin
-  if FConnected and not (VarIsEmpty(ovObject) or VarIsNull(ovObject)) then
-  begin
-    try
+  if FConnected and FRObjectReady then
+    RunFR('Disconnect', procedure
+    begin
       ovObject.Disconnect;
-      CheckFRResult('Disconnect');
-    except
-      on E: Exception do
-      begin
-        FLog.LogError('[FR] Disconnect: ' + E.Message);
-        if not FEmulation then
-          raise;
-      end;
-    end;
-  end;
+    end);
   FConnected := False;
 end;
 
@@ -567,6 +656,62 @@ begin
   end;
 end;
 
+function TVariantPrint.ConnectJson: string;
+begin
+  FLock.Enter;
+  try
+    try
+      EnsureFRConnected;
+      Result := JsonOk('"connected":true');
+      FLog.LogInfo('ConnectJson OK');
+    except
+      on E: Exception do
+      begin
+        FLog.LogError('ConnectJson: ' + E.Message);
+        if FEmulation then
+          Result := JsonOk('"connected":true')
+        else
+          Result := JsonError(E.Message);
+      end;
+    end;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+{-------------------------------------------------------------------------------
+ /connection-status — статус связи и настройки FSettings (без принудительного Connect)
+-------------------------------------------------------------------------------}
+
+function TVariantPrint.KktConnectionStatusJson: string;
+var
+  ComPort, Baud, Password, HttpPort: Integer;
+  Cashier: string;
+  Connected: Boolean;
+begin
+  FLock.Enter;
+  try
+    ComPort := FSettings.ReadInteger('FRCash', 'Port', 1);
+    Baud := FSettings.ReadInteger('FRCash', 'Baud', 6);
+    Password := FSettings.ReadInteger('FRCash', 'Password', 30);
+    HttpPort := FSettings.ReadInteger('HttpServer', 'Port', 2580);
+    Cashier := FSettings.ReadString('FRCash', 'CashierName', 'Кассир');
+    Connected := CheckLinkAlive;
+
+    Result := JsonOk(
+      '"connected":' + BoolToStr(Connected, True).ToLower + ',' +
+      '"comPort":' + IntToStr(ComPort) + ',' +
+      '"baudRate":' + IntToStr(Baud) + ',' +
+      '"password":' + IntToStr(Password) + ',' +
+      '"cashierName":"' + JsonEscape(Cashier) + '",' +
+      '"httpPort":' + IntToStr(HttpPort) + ',' +
+      '"emulation":' + BoolToStr(FEmulation, True).ToLower + ',' +
+      '"testReceiptMode":' + BoolToStr(FTestReceiptMode, True).ToLower);
+  finally
+    FLock.Leave;
+  end;
+end;
+
 {-------------------------------------------------------------------------------
  /info
 -------------------------------------------------------------------------------}
@@ -580,48 +725,42 @@ begin
     try
       EnsureFRConnected;
 
-      SerialNumber := FEmulatedSerial;
-      Inn := FEmulatedInn;
-      KKTRegistrationNumber:=FEmulatedRegNumber;
-      FnNumber := FEmulatedFnNumber;
+      SerialNumber := '';
+      Inn := '';
+      KKTRegistrationNumber := '';
+      FnNumber := '';
 
-      if not (VarIsEmpty(ovObject) or VarIsNull(ovObject)) then
+      RunFR('GetECRStatus', procedure
       begin
-        try
-          ovObject.GetECRStatus;
-          CheckFRResult('GetECRStatus');
-          SerialNumber := ReadSerialNumber;
+        ovObject.GetECRStatus;
+      end);
+      SerialNumber := ReadSerialNumber;
 
-          try
-            ovObject.FNGetFiscalizationResult;
-            CheckFRResult('FNGetFiscalizationResult');
-            try Inn := VarToStr(ovObject.INN); except end;
-            try KKTRegistrationNumber := VarToStr(ovObject.KKTRegistrationNumber); except end;
-            ovObject.FNGetSerial;
-            CheckFRResult('FNGetSerial');
-            try FnNumber := VarToStr(ovObject.SerialNumber); except end;
-            try if FnNumber = '' then FnNumber := VarToStr(ovObject.FiscalStorageNumber); except end;
-          except
-            on E: Exception do
-            begin
-              FLog.LogError('[FR] FNGetFiscalizationResult: ' + E.Message);
-              if not FEmulation then
-                raise;
-            end;
-          end;
-        except
-          on E: Exception do
-          begin
-            FLog.LogError('[FR] KktInfoJson GetECRStatus: ' + E.Message);
-            if not FEmulation then
-              raise;
-          end;
-        end;
+      RunFR('FNGetFiscalizationResult', procedure
+      begin
+        ovObject.FNGetFiscalizationResult;
+      end);
+      if not FEmulation and FRObjectReady then
+      begin
+        try Inn := VarToStr(ovObject.INN); except end;
+        try KKTRegistrationNumber := VarToStr(ovObject.KKTRegistrationNumber); except end;
       end;
 
-      if Inn = '' then Inn := FEmulatedInn;
-      if KKTRegistrationNumber = '' then KKTRegistrationNumber := FEmulatedInn;
-      if FnNumber = '' then FnNumber := FEmulatedFnNumber;
+      RunFR('FNGetSerial', procedure
+      begin
+        ovObject.FNGetSerial;
+      end);
+      if not FEmulation and FRObjectReady then
+      begin
+        try FnNumber := VarToStr(ovObject.SerialNumber); except end;
+        try if FnNumber = '' then FnNumber := VarToStr(ovObject.FiscalStorageNumber); except end;
+      end;
+
+      if FEmulation then begin
+       if Inn = '' then Inn := FEmulatedInn;
+       if KKTRegistrationNumber = '' then KKTRegistrationNumber := FEmulatedInn;
+       if FnNumber = '' then FnNumber := FEmulatedFnNumber;
+      end;
 
       Result := JsonOk(
         '"serialNumber":"' + JsonEscape(SerialNumber) + '",' +
@@ -655,47 +794,52 @@ end;
 -------------------------------------------------------------------------------}
 
 procedure TVariantPrint.SendIndustryRequisite126x(const Tag1262, Tag1263, Tag1264,
-  UUID, TimeStr: string);
+  UUID, TimeStr, Inst, Version: string);
+var OtrsaslRekvizit:string;
 begin
   if (UUID = '') or (TimeStr = '') then
     Exit;
 
-  if not FRObjectReady then
+  FLog.LogInfo(Format('Теги РР: 1262=%s 1263=%s 1264=%s 1265 UUID=%s Time=%s Inst=%s Version=%s',
+    [Tag1262, Tag1263, Tag1264, UUID, TimeStr, Inst, Version]));
+
+  RunFR('FNSendTagOperation 1262', procedure
   begin
-    LogFRSkipped('SendIndustryRequisite126x');
-    Exit;
-  end;
+    ovObject.TagNumber := 1262;
+    ovObject.TagType := 7;
+    ovObject.TagValueStr := Tag1262;
+    ovObject.FNSendTagOperation;
+    FLog.LogDebug('[FR] 1262: ' + Tag1262 + ' -> ' + FRResultText(ovObject));
+  end);
 
-  FLog.LogInfo(Format('Теги РР: 1262=%s 1263=%s 1264=%s 1265 UUID=%s Time=%s',
-    [Tag1262, Tag1263, Tag1264, UUID, TimeStr]));
+  RunFR('FNSendTagOperation 1263', procedure
+  begin
+    ovObject.TagNumber := 1263;
+    ovObject.TagType := 7;
+    ovObject.TagValueStr := Tag1263;
+    ovObject.FNSendTagOperation;
+    FLog.LogDebug('[FR] 1263: ' + Tag1263 + ' -> ' + FRResultText(ovObject));
+  end);
 
-  ovObject.TagNumber := 1262;
-  ovObject.TagType := 7;
-  ovObject.TagValueStr := Tag1262;
-  ovObject.FNSendTagOperation;
-  FLog.LogDebug('[FR] 1262: ' + Tag1262 + ' -> ' + FRResultText(ovObject));
-  CheckFRResult('FNSendTagOperation 1262');
+  RunFR('FNSendTagOperation 1264', procedure
+  begin
+    ovObject.TagNumber := 1264;
+    ovObject.TagType := 7;
+    ovObject.TagValueStr := Tag1264;
+    ovObject.FNSendTagOperation;
+    FLog.LogDebug('[FR] 1264: ' + Tag1264 + ' -> ' + FRResultText(ovObject));
+  end);
 
-  ovObject.TagNumber := 1263;
-  ovObject.TagType := 7;
-  ovObject.TagValueStr := Tag1263;
-  ovObject.FNSendTagOperation;
-  FLog.LogDebug('[FR] 1263: ' + Tag1263 + ' -> ' + FRResultText(ovObject));
-  CheckFRResult('FNSendTagOperation 1263');
-
-  ovObject.TagNumber := 1264;
-  ovObject.TagType := 7;
-  ovObject.TagValueStr := Tag1264;
-  ovObject.FNSendTagOperation;
-  FLog.LogDebug('[FR] 1264: ' + Tag1264 + ' -> ' + FRResultText(ovObject));
-  CheckFRResult('FNSendTagOperation 1264');
-
-  ovObject.TagNumber := 1265;
-  ovObject.TagType := 7;
-  ovObject.TagValueStr := 'UUID=' + UUID + '&Time=' + TimeStr;
-  ovObject.FNSendTagOperation;
-  FLog.LogDebug('[FR] 1265: UUID=' + UUID + '&Time=' + TimeStr + ' -> ' + FRResultText(ovObject));
-  CheckFRResult('FNSendTagOperation 1265');
+  RunFR('FNSendTagOperation 1265', procedure
+  begin
+    ovObject.TagNumber := 1265;
+    ovObject.TagType := 7;
+    OtrsaslRekvizit:='UUID=' + UUID + '&Time=' + TimeStr;
+    if Inst<>'' then OtrsaslRekvizit:=OtrsaslRekvizit+'&Inst='+Inst+'&Ver='+Version;
+    ovObject.TagValueStr := OtrsaslRekvizit;
+    ovObject.FNSendTagOperation;
+    FLog.LogDebug('[FR] 1265: ' + OtrsaslRekvizit + ' -> ' + FRResultText(ovObject));
+  end);
 end;
 
 procedure TVariantPrint.SendMarkingCodeAfterFNOperation(const MarkKkt: string);
@@ -703,17 +847,13 @@ begin
   if MarkKkt = '' then
     Exit;
 
-  if not FRObjectReady then
+  RunFR('FNSendItemBarcode', procedure
   begin
-    LogFRSkipped('FNSendItemBarcode');
-    Exit;
-  end;
-
-  FLog.LogDebug('[FR] FNSendItemBarcode begin: ' + MarkKkt);
-  ovObject.BarCode := MarkKkt;
-  ovObject.FNSendItemBarcode;
-  FLog.LogDebug('[FR] FNSendItemBarcode: ' + FRResultText(ovObject));
-  CheckFRResult('FNSendItemBarcode');
+    FLog.LogDebug('[FR] FNSendItemBarcode begin: ' + MarkKkt);
+    ovObject.BarCode := MarkKkt;
+    ovObject.FNSendItemBarcode;
+    FLog.LogDebug('[FR] FNSendItemBarcode: ' + FRResultText(ovObject));
+  end);
 end;
 
 function TVariantPrint.MarkCacheKey(const MarkDecoded: string; ReturnCheck: Boolean): string;
@@ -741,7 +881,7 @@ begin
   if not FAcceptedMarks.ContainsKey(Key) then
   begin
     FAcceptedMarks.Add(Key, 1);
-    FLog.LogDebug('Кэш марки: добавлена, len=' + IntToStr(Length(MarkDecoded)) +
+    FLog.LogInfo('Кэш марки: добавлена, len=' + IntToStr(Length(MarkDecoded)) +
       ', return=' + BoolToStr(ReturnCheck, True));
   end;
 end;
@@ -763,12 +903,6 @@ begin
   if MarkDecoded = '' then
     Exit;
 
-  if not FRObjectReady then
-  begin
-    LogFRSkipped('ProcessMarkingAfterFNOperation');
-    Exit;
-  end;
-
   FromCache := IsMarkAcceptedInCache(MarkDecoded, ReturnCheck);
   EffectiveAccepted := MarkAccepted or FromCache;
 
@@ -784,27 +918,34 @@ begin
   end;
 
   FLog.LogInfo('Полный цикл маркировки в чеке');
-  if ReturnCheck then
-    ovObject.ItemStatus := 3
-  else
-    ovObject.ItemStatus := 1;
-  ovObject.CheckItemMode := 0;
-  ovObject.TLVDataHEX := '';
-  ovObject.BarCode := MarkDecoded;
+  RunFR('FNCheckItemBarcode', procedure
+  begin
+    if ReturnCheck then
+      ovObject.ItemStatus := 3
+    else
+      ovObject.ItemStatus := 1;
+    ovObject.CheckItemMode := 0;
+    ovObject.TLVDataHEX := '';
+    ovObject.BarCode := MarkDecoded;
+    ovObject.FNCheckItemBarcode;
+  end);
 
-  ovObject.FNCheckItemBarcode;
-  CheckFRResult('FNCheckItemBarcode');
+  RunFR('FNSendItemBarcode (1)', procedure
+  begin
+    ovObject.BarCode := MarkDecoded;
+    ovObject.FNSendItemBarcode;
+  end);
 
-  ovObject.BarCode := MarkDecoded;
-  ovObject.FNSendItemBarcode;
-  CheckFRResult('FNSendItemBarcode (1)');
+  RunFR('FNAcceptMarkingCode', procedure
+  begin
+    ovObject.FNAcceptMarkingCode;
+  end);
 
-  ovObject.FNAcceptMarkingCode;
-  CheckFRResult('FNAcceptMarkingCode');
-
-  ovObject.BarCode := MarkDecoded;
-  ovObject.FNSendItemBarcode;
-  CheckFRResult('FNSendItemBarcode (2)');
+  RunFR('FNSendItemBarcode (2)', procedure
+  begin
+    ovObject.BarCode := MarkDecoded;
+    ovObject.FNSendItemBarcode;
+  end);
 
   AddMarkToAcceptedCache(MarkDecoded, ReturnCheck);
 end;
@@ -833,49 +974,44 @@ procedure TVariantPrint.ApplyReceiptHeader(Req: TJSONObject; ReturnCheck: Boolea
 var
   TaxTypeVal: Integer;
 begin
-  if not FRObjectReady then
-    Exit;
-
-  if ReturnCheck then
-    ovObject.CheckType := 2
-  else
-    ovObject.CheckType := 0;
-
   TaxTypeVal := MapTaxationType(JStr(Req, 'taxationType'));
+
+  RunFR('ApplyReceiptHeader CheckType', procedure
+  begin
+    if ReturnCheck then
+      ovObject.CheckType := 2
+    else
+      ovObject.CheckType := 0;
+  end);
+
   if TaxTypeVal > 0 then
   begin
-    try
+    FLog.LogInfo('TaxType (СНО)=' + IntToStr(TaxTypeVal));
+    RunFR('ApplyReceiptHeader TaxType', procedure
+    begin
       ovObject.TaxType := TaxTypeVal;
-      FLog.LogInfo('TaxType (СНО)=' + IntToStr(TaxTypeVal));
-    except
-      on E: Exception do
-        FLog.LogInfo('TaxType недоступен: ' + E.Message);
-    end;
+    end);
   end;
 end;
 
 procedure TVariantPrint.PrintReceiptText(const Text: string);
 begin
-  if not FRObjectReady then
-  begin
-    LogFRSkipped('PrintString');
-    Exit;
-  end;
-
   FLog.LogInfo('PrintString: "' + Text + '"');
-  try
-    ovObject.UseReceiptRibbon := 1;
-  except
-  end;
-  ovObject.StringForPrinting := Text;
-  ovObject.PrintString;
-  CheckFRResult('PrintString');
+  RunFR('PrintString', procedure
+  begin
+    try
+      ovObject.UseReceiptRibbon := 1;
+    except
+    end;
+    ovObject.StringForPrinting := Text;
+    ovObject.PrintString;
+  end);
 end;
 
 procedure TVariantPrint.RegisterReceiptItem(Item: TJSONObject; ReturnCheck: Boolean;
   DefaultDepartment: Integer);
 var
-  Name, MarkB64, MarkDecoded, UUID, TimeStr, ItemType: string;
+  Name, MarkB64, MarkDecoded, UUID, TimeStr, Inst, Version, ItemType: string;
   Tag1262, Tag1263, Tag1264: string;
   TaxObj, PermObj: TJSONObject;
   Qty, Price: Double;
@@ -902,6 +1038,8 @@ begin
   PermObj := Item.GetValue('permission') as TJSONObject;
   UUID := '';
   TimeStr := '';
+  Inst := '';
+  Version := '';
   Tag1262 := '030';
   Tag1263 := '21.11.2023';
   Tag1264 := '1944';
@@ -909,6 +1047,8 @@ begin
   begin
     UUID := JStr(PermObj, 'uuid');
     TimeStr := JStr(PermObj, 'time');
+    Inst := JStr(PermObj, 'inst');
+    Version := JStr(PermObj, 'version');
     Tag1262 := JStr(PermObj, 'tag1262', Tag1262);
     Tag1263 := JStr(PermObj, 'tag1263', Tag1263);
     Tag1264 := JStr(PermObj, 'tag1264', Tag1264);
@@ -928,35 +1068,29 @@ begin
     [Name, Qty, Price, Department, Tax1, PayObj, PayMethod, Length(MarkDecoded),
      BoolToStr(MarkAccepted, True)]));
 
-  if not FRObjectReady then
+  RunFR('FNOperation', procedure
   begin
-    LogFRSkipped('FNOperation "' + Name + '"');
-    Exit;
-  end;
-
-  ovObject.StringForPrinting := Name;
-  ovObject.Quantity := Qty;
-  ovObject.Price := Price;
-  ovObject.Department := Department;
-  ovObject.Tax1 := Tax1;
-  ovObject.Tax2 := 0;
-  ovObject.Tax3 := 0;
-  ovObject.Tax4 := 0;
-  ovObject.PaymentTypeSign := PayMethod;
-  ovObject.PaymentItemSign := PayObj;
-
-  try
-    ovObject.MeasureUnit := MapMeasureUnit(JStr(Item, 'measurementUnit'));
-  except
-  end;
-
-  ovObject.FNOperation;
-  CheckFRResult('FNOperation');
+    ovObject.StringForPrinting := Name;
+    ovObject.Quantity := Qty;
+    ovObject.Price := Price;
+    ovObject.Department := Department;
+    ovObject.Tax1 := Tax1;
+    ovObject.Tax2 := 0;
+    ovObject.Tax3 := 0;
+    ovObject.Tax4 := 0;
+    ovObject.PaymentTypeSign := PayMethod;
+    ovObject.PaymentItemSign := PayObj;
+    try
+      ovObject.MeasureUnit := MapMeasureUnit(JStr(Item, 'measurementUnit'));
+    except
+    end;
+    ovObject.FNOperation;
+  end);
 
   if HasMark and (not ReturnCheck) then
   begin
     if (UUID <> '') and (TimeStr <> '') then
-      SendIndustryRequisite126x(Tag1262, Tag1263, Tag1264, UUID, TimeStr)
+      SendIndustryRequisite126x(Tag1262, Tag1263, Tag1264, UUID, TimeStr, Inst, Version)
     else
       FLog.LogInfo('WARN: маркированная позиция без permission — теги РР не отправляются');
   end;
@@ -974,24 +1108,14 @@ var
   Pay: TJSONObject;
   I, Payment: Integer;
   PayType: string;
-  Sum, Total, Received: Double;
+  Sum, Total, Received, Summ1, Summ2, Summ15: Double;
   TaxTypeVal: Integer;
 begin
   Total := JFloat(Req, 'total', 0);
   Received := JFloat(Req, 'received', Total);
-
-  if not FRObjectReady then
-  begin
-    LogFRSkipped('FNCloseCheckEx');
-    Exit;
-  end;
-
-  ovObject.StringForPrinting := '';
-
-  ovObject.Summ1 := 0;  ovObject.Summ2 := 0;  ovObject.Summ3 := 0;  ovObject.Summ4 := 0;
-  ovObject.Summ5 := 0;  ovObject.Summ6 := 0;  ovObject.Summ7 := 0;  ovObject.Summ8 := 0;
-  ovObject.Summ9 := 0;  ovObject.Summ10 := 0; ovObject.Summ11 := 0; ovObject.Summ12 := 0;
-  ovObject.Summ13 := 0; ovObject.Summ14 := 0; ovObject.Summ15 := 0; ovObject.Summ16 := 0;
+  Summ1 := 0;
+  Summ2 := 0;
+  Summ15 := 0;
 
   Payments := Req.GetValue('payments') as TJSONArray;
   if (Payments <> nil) and (Payments.Count > 0) then
@@ -1004,58 +1128,81 @@ begin
       PayType := LowerCase(Trim(JStr(Pay, 'type')));
       Sum := JFloat(Pay, 'sum', 0);
       if PayType = 'cash' then
-        ovObject.Summ1 := ovObject.Summ1 + Sum
+        Summ1 := Summ1 + Sum
       else if PayType = 'electronically' then
-        ovObject.Summ2 := ovObject.Summ2 + Sum
+        Summ2 := Summ2 + Sum
       else if PayType = 'credit' then
-        ovObject.Summ15 := ovObject.Summ15 + Sum
+        Summ15 := Summ15 + Sum
       else
         FLog.LogInfo('WARN: неизвестный тип оплаты "' + PayType + '"');
     end;
-    FLog.LogInfo(Format('FNCloseCheckEx: payments[] total=%g Summ1=%g Summ2=%g Summ15=%g',
-      [Total, ovObject.Summ1, ovObject.Summ2, ovObject.Summ15]));
+    FLog.LogInfo('FNCloseCheckEx: payments[] total=' + FloatToStr(Total) +
+      ' Summ1=' + FloatToStr(Summ1) +
+      ' Summ2=' + FloatToStr(Summ2) +
+      ' Summ15=' + FloatToStr(Summ15));
   end
   else
   begin
     Payment := JInt(Req, 'payment', 0);
-    FLog.LogInfo(Format('FNCloseCheckEx: payment=%d total=%g received=%g',
-      [Payment, Total, Received]));
+    FLog.LogInfo('FNCloseCheckEx: payment=' + IntToStr(Payment) +
+      ' total=' + FloatToStr(Total) + ' received=' + FloatToStr(Received));
     case Payment of
-      0: ovObject.Summ1 := Total;
-      1: ovObject.Summ2 := Total;
-      2: ovObject.Summ15 := Received;
+      0: Summ1 := Total;
+      1: Summ2 := Total;
+      2: Summ15 := Received;
     else
-      ovObject.Summ1 := Total;
+      Summ1 := Total;
     end;
   end;
 
   TaxTypeVal := MapTaxationType(JStr(Req, 'taxationType'));
-  if TaxTypeVal > 0 then
+
+  if FTestReceiptMode then
   begin
-    try
-      ovObject.TaxType := TaxTypeVal;
-    except
-      on E: Exception do
-        FLog.LogInfo('TaxType при закрытии недоступен: ' + E.Message);
-    end;
+    FLog.LogInfo('Тестовый режим: CancelCheck вместо FNCloseCheckEx');
+    RunFR('CancelCheck', procedure
+    begin
+      ovObject.CancelCheck;
+    end);
+  end
+  else
+  begin
+    RunFR('FNCloseCheckEx', procedure
+    begin
+      ovObject.StringForPrinting := '';
+      ovObject.Summ1 := Summ1;
+      ovObject.Summ2 := Summ2;
+      ovObject.Summ3 := 0;
+      ovObject.Summ4 := 0;
+      ovObject.Summ5 := 0;
+      ovObject.Summ6 := 0;
+      ovObject.Summ7 := 0;
+      ovObject.Summ8 := 0;
+      ovObject.Summ9 := 0;
+      ovObject.Summ10 := 0;
+      ovObject.Summ11 := 0;
+      ovObject.Summ12 := 0;
+      ovObject.Summ13 := 0;
+      ovObject.Summ14 := 0;
+      ovObject.Summ15 := Summ15;
+      ovObject.Summ16 := 0;
+      if TaxTypeVal > 0 then
+        ovObject.TaxType := TaxTypeVal;
+      ovObject.RoundingSumm := 0;
+      ovObject.TaxValue1 := 0;
+      ovObject.TaxValue2 := 0;
+      ovObject.TaxValue3 := 0;
+      ovObject.TaxValue4 := 0;
+      ovObject.TaxValue5 := 0;
+      ovObject.TaxValue6 := 0;
+      ovObject.FNCloseCheckEx;
+    end);
   end;
-
-  ovObject.RoundingSumm := 0;
-  ovObject.TaxValue1 := 0;
-  ovObject.TaxValue2 := 0;
-  ovObject.TaxValue3 := 0;
-  ovObject.TaxValue4 := 0;
-  ovObject.TaxValue5 := 0;
-  ovObject.TaxValue6 := 0;
-
-  ovObject.FNCloseCheckEx;
-  CheckFRResult('FNCloseCheckEx');
   ClearAcceptedMarksCache;
 end;
 
 function TVariantPrint.PrintCheckJson(const Body: string): string;
 var
-  V: TJSONValue;
   Req, Item: TJSONObject;
   Items: TJSONArray;
   I, CheckNumber: Integer;
@@ -1066,15 +1213,12 @@ begin
   FLock.Enter;
   try
     Result := JsonError('Unknown error');
-    V := nil;
+    Req := nil;
     try
       FLog.LogInfo('PrintCheckJson begin');
       EnsureFRConnected;
 
-      V := TJSONObject.ParseJSONValue(Body);
-      if not (V is TJSONObject) then
-        raise Exception.Create('Invalid JSON');
-      Req := TJSONObject(V);
+      Req := ParseJsonObjectOrRaise(Body, 'PrintCheckJson', FLog);
 
       ReturnCheck := GetReceiptReturnCheck(Req);
       CashierName := GetCashierName(Req);
@@ -1106,21 +1250,14 @@ begin
       CheckNumber := ReadCheckNumberAfterClose;
       SerialNumber := ReadSerialNumber;
 
-      if not (VarIsEmpty(ovObject) or VarIsNull(ovObject)) then
-      begin
-        try
+      if not FTestReceiptMode then
+        RunFR('CutCheck', procedure
+        begin
           ovObject.CutType := 1;
           ovObject.CutCheck;
-          CheckFRResult('CutCheck');
-        except
-          on E: Exception do
-          begin
-            FLog.LogError('[FR] CutCheck: ' + E.Message);
-            if not FEmulation then
-              raise;
-          end;
-        end;
-      end;
+        end)
+      else
+        FLog.LogInfo('Тестовый режим: CutCheck пропущен');
 
       Result := JsonOk(
         '"checkNumber":' + IntToStr(CheckNumber) + ',' +
@@ -1136,13 +1273,10 @@ begin
         FLog.LogError('PrintCheckJson: ' + E.Message);
         if FEmulation then
         begin
-          try
-            if not (VarIsEmpty(ovObject) or VarIsNull(ovObject)) then
-              ovObject.CancelCheck;
-          except
-            on E2: Exception do
-              FLog.LogError('[FR] CancelCheck after error: ' + E2.Message);
-          end;
+          RunFR('CancelCheck after error', procedure
+          begin
+            ovObject.CancelCheck;
+          end);
           ClearAcceptedMarksCache;
           Inc(FEmulatedCheckNumber);
           Result := JsonOk(
@@ -1158,7 +1292,7 @@ begin
         end;
       end;
     end;
-    V.Free;
+    Req.Free;
   finally
     FLock.Leave;
   end;
@@ -1185,13 +1319,10 @@ begin
         Req := TJSONObject(V);
 
       EnsureFRConnected;
-      if not FRObjectReady then
-        LogFRSkipped('PrintReportWithCleaning')
-      else
+      RunFR('PrintReportWithCleaning', procedure
       begin
         ovObject.PrintReportWithCleaning;
-        CheckFRResult('PrintReportWithCleaning');
-      end;
+      end);
 
       SessionNumber := ReadSessionNumberAfterClose;
 
@@ -1236,13 +1367,10 @@ begin
         Req := TJSONObject(V);
 
       EnsureFRConnected;
-      if not FRObjectReady then
-        LogFRSkipped('PrintReportWithoutCleaning')
-      else
+      RunFR('PrintReportWithoutCleaning', procedure
       begin
         ovObject.PrintReportWithoutCleaning;
-        CheckFRResult('PrintReportWithoutCleaning');
-      end;
+      end);
       Result := JsonOk;
       FLog.LogInfo('XReportJson OK');
       AfterCommand(Req);
@@ -1281,13 +1409,10 @@ begin
         Req := TJSONObject(V);
 
       EnsureFRConnected;
-      if not FRObjectReady then
-        LogFRSkipped('CancelCheck')
-      else
+      RunFR('CancelCheck', procedure
       begin
         ovObject.CancelCheck;
-        CheckFRResult('CancelCheck');
-      end;
+      end);
       ClearAcceptedMarksCache;
       Result := JsonOk;
       FLog.LogInfo('CancelCheckJson OK');
@@ -1296,6 +1421,50 @@ begin
       on E: Exception do
       begin
         FLog.LogError('CancelCheckJson: ' + E.Message);
+        if FEmulation then
+        begin
+          Result := JsonOk;
+          ClearAcceptedMarksCache;
+          AfterCommand(Req);
+        end
+        else
+          Result := JsonError(E.Message);
+      end;
+    end;
+    V.Free;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TVariantPrint.ClearBufferOfMarksJson(const Body: string = ''): string;
+var
+  V: TJSONValue;
+  Req: TJSONObject;
+begin
+  FLock.Enter;
+  try
+    V := nil;
+    try
+      FLog.LogInfo('ClearBufferOfMarksJson begin');
+      V := TJSONObject.ParseJSONValue(Body);
+      Req := nil;
+      if V is TJSONObject then
+        Req := TJSONObject(V);
+
+      EnsureFRConnected;
+      RunFR('FNMarkingClearBuffer', procedure
+      begin
+        ovObject.FNMarkingClearBuffer;
+      end);
+      ClearAcceptedMarksCache;
+      Result := JsonOk;
+      FLog.LogInfo('ClearBufferOfMarksJson OK');
+      AfterCommand(Req);
+    except
+      on E: Exception do
+      begin
+        FLog.LogError('ClearBufferOfMarksJson: ' + E.Message);
         if FEmulation then
         begin
           Result := JsonOk;
@@ -1386,7 +1555,7 @@ var
 begin
   SetLength(MarksB64, 0);
   if Req = nil then
-    raise Exception.Create('Invalid JSON');
+    raise Exception.Create('Invalid request');
 
   Arr := Req.GetValue('marks') as TJSONArray;
   if Arr <> nil then
@@ -1412,17 +1581,18 @@ var
   SessionNotOpen: Boolean;
   Cashier: string;
 begin
+  RunFR('GetECRStatus EnsureSessionOpen', procedure
+  begin
+    ovObject.GetECRStatus;
+  end);
+
+  if FEmulation then
+    Exit;
   if not FRObjectReady then
   begin
     LogFRSkipped('EnsureSessionOpen');
     Exit;
   end;
-
-  if FEmulation then
-    Exit;
-
-  ovObject.GetECRStatus;
-  CheckFRResult('GetECRStatus EnsureSessionOpen');
 
   SessionNotOpen := False;
   try
@@ -1440,22 +1610,28 @@ begin
 
   FLog.LogInfo('Смена не открыта — открываем (кассир: ' + Cashier + ')');
 
-  ovObject.TableNumber := 2;
-  ovObject.FieldNumber := 2;
-  ovObject.RowNumber := 30;
-  ovObject.ValueOfFieldString := Cashier;
-  ovObject.WriteTable;
-  CheckFRResult('WriteTable cashier');
+  RunFR('WriteTable cashier', procedure
+  begin
+    ovObject.TableNumber := 2;
+    ovObject.FieldNumber := 2;
+    ovObject.RowNumber := 30;
+    ovObject.ValueOfFieldString := Cashier;
+    ovObject.WriteTable;
+  end);
 
-  ovObject.TableNumber := 1;
-  ovObject.FieldNumber := 6;
-  ovObject.RowNumber := 1;
-  ovObject.ValueOfFieldInteger := 0;
-  ovObject.WriteTable;
-  CheckFRResult('WriteTable session flag');
+  RunFR('WriteTable session flag', procedure
+  begin
+    ovObject.TableNumber := 1;
+    ovObject.FieldNumber := 6;
+    ovObject.RowNumber := 1;
+    ovObject.ValueOfFieldInteger := 0;
+    ovObject.WriteTable;
+  end);
 
-  ovObject.OpenSession;
-  CheckFRResult('OpenSession');
+  RunFR('OpenSession', procedure
+  begin
+    ovObject.OpenSession;
+  end);
 end;
 
 function TVariantPrint.CheckSingleMark(const MarkDecoded: string;
@@ -1469,7 +1645,8 @@ begin
 
   if IsMarkAcceptedInCache(MarkDecoded, ReturnCheck) then
   begin
-    FLog.LogInfo('Марка уже принята в текущем чеке — пропуск FNCheckItemBarcode');
+    FLog.LogInfo('check-marks: марка из кэша чека — skip FNCheckItemBarcode, len=' +
+      IntToStr(Length(MarkDecoded)));
     Result.AddPair('accepted', TJSONBool.Create(True));
     Result.AddPair('resultCode', TJSONNumber.Create(0));
     Result.AddPair('checkItemLocalResult', TJSONNumber.Create(15));
@@ -1481,7 +1658,20 @@ begin
     Exit;
   end;
 
-  if FEmulation or not FRObjectReady then
+  FLog.LogInfo('FNCheckItemBarcode begin, len=' + IntToStr(Length(MarkDecoded)));
+  RunFR('FNCheckItemBarcode', procedure
+  begin
+    if ReturnCheck then
+      ovObject.ItemStatus := 3
+    else
+      ovObject.ItemStatus := 1;
+    ovObject.CheckItemMode := 0;
+    ovObject.TLVDataHEX := '';
+    ovObject.BarCode := MarkDecoded;
+    ovObject.FNCheckItemBarcode;
+  end);
+
+  if FEmulation then
   begin
     Result.AddPair('accepted', TJSONBool.Create(True));
     Result.AddPair('resultCode', TJSONNumber.Create(0));
@@ -1495,16 +1685,11 @@ begin
     Exit;
   end;
 
-  if ReturnCheck then
-    ovObject.ItemStatus := 3
-  else
-    ovObject.ItemStatus := 1;
-  ovObject.CheckItemMode := 0;
-  ovObject.TLVDataHEX := '';
-  ovObject.BarCode := MarkDecoded;
-
-  FLog.LogInfo('FNCheckItemBarcode begin');
-  ovObject.FNCheckItemBarcode;
+  if not FRObjectReady then
+  begin
+    LogFRSkipped('FNCheckItemBarcode');
+    Exit;
+  end;
 
   ResCheck := 0;
   try
@@ -1559,34 +1744,331 @@ begin
   begin
     Accepted := False;
     FLog.LogError('Ошибка проверки марки: ' + IntToStr(ResCheck) + ' ' + Desc);
-    try
+    RunFR('FNDeclineMarkingCode', procedure
+    begin
       ovObject.FNDeclineMarkingCode;
       FLog.LogDebug('[FR] FNDeclineMarkingCode: ' + FRResultText(ovObject));
-    except
-      on E: Exception do
-        FLog.LogError('[FR] FNDeclineMarkingCode: ' + E.Message);
-    end;
+    end);
   end
   else
   begin
     Accepted := True;
-    try
+    RunFR('FNAcceptMarkingCode', procedure
+    begin
       ovObject.FNAcceptMarkingCode;
       FLog.LogDebug('[FR] FNAcceptMarkingCode: ' + FRResultText(ovObject));
-    except
-      on E: Exception do
-      begin
-        FLog.LogError('[FR] FNAcceptMarkingCode: ' + E.Message);
-        if not FEmulation then
-          raise;
-      end;
-    end;
+    end);
   end;
 
   if Accepted then
     AddMarkToAcceptedCache(MarkDecoded, ReturnCheck);
 
   Result.AddPair('accepted', TJSONBool.Create(Accepted));
+end;
+
+procedure TVariantPrint.ReadInnAndFn(out Inn, FnNumber: string);
+begin
+  Inn := '';
+  FnNumber := '';
+  if FEmulation then
+  begin
+    Inn := FEmulatedInn;
+    FnNumber := FEmulatedFnNumber;
+    Exit;
+  end;
+  if not FRObjectReady then
+    Exit;
+
+  RunFR('FNGetFiscalizationResult permission', procedure
+  begin
+    ovObject.FNGetFiscalizationResult;
+  end);
+  try
+    Inn := VarToStr(ovObject.INN);
+  except
+  end;
+
+  RunFR('FNGetSerial permission', procedure
+  begin
+    ovObject.FNGetSerial;
+  end);
+  try
+    FnNumber := VarToStr(ovObject.SerialNumber);
+  except
+  end;
+  try
+    if FnNumber = '' then
+      FnNumber := VarToStr(ovObject.FiscalStorageNumber);
+  except
+  end;
+end;
+
+function TVariantPrint.ResolvePermissionInn(Req: TJSONObject): string;
+var
+  Fn: string;
+begin
+  Result := JStr(Req, 'inn', '');
+  if Result = '' then
+    Result := JStr(Req, 'ИНН', '');
+  if Result = '' then
+    ReadInnAndFn(Result, Fn);
+end;
+
+function TVariantPrint.ResolvePermissionFn(Req: TJSONObject): string;
+var
+  Inn: string;
+begin
+  Result := JStr(Req, 'fnNumber', '');
+  if Result = '' then
+    Result := JStr(Req, 'fn', '');
+  if Result = '' then
+    Result := JStr(Req, 'ФН', '');
+  if Result = '' then
+    ReadInnAndFn(Inn, Result);
+end;
+
+function TVariantPrint.BuildDocumentCheckJson(const MarkB64, Inn, Fn: string): string;
+var
+  Root, Pos, Org: TJSONObject;
+  PositionsArr, CodesArr: TJSONArray;
+begin
+  Root := TJSONObject.Create;
+  try
+    Root.AddPair('action', 'check');
+    Root.AddPair('type', 'receipt');
+    if Trim(Fn) <> '' then
+      Root.AddPair('shift', Fn);
+
+    PositionsArr := TJSONArray.Create;
+    Pos := TJSONObject.Create;
+    Org := TJSONObject.Create;
+    Org.AddPair('inn', Inn);
+    Pos.AddPair('organization', Org);
+
+    CodesArr := TJSONArray.Create;
+    CodesArr.AddElement(TJSONString.Create(MarkB64));
+    Pos.AddPair('marking_codes', CodesArr);
+
+    PositionsArr.AddElement(Pos);
+    Root.AddPair('positions', PositionsArr);
+    Result := JsonToPlainText(Root);
+  finally
+    Root.Free;
+  end;
+end;
+
+function TVariantPrint.HttpPostJson(const Url, Body: string): string;
+var
+  Http: TIdHTTP;
+  ReqStream: TStringStream;
+begin
+  Http := TIdHTTP.Create(nil);
+  ReqStream := TStringStream.Create(Body, TEncoding.UTF8);
+  try
+    Http.Request.ContentType := 'application/json';
+    Http.ConnectTimeout := 30000;
+    Http.ReadTimeout := 180000;
+    Result := Http.Post(Url, ReqStream);
+  finally
+    ReqStream.Free;
+    Http.Free;
+  end;
+end;
+
+function TVariantPrint.ExtractFirstTruemarkCode(Truemark: TJSONObject): TJSONObject;
+var
+  CodesV: TJSONValue;
+  Arr: TJSONArray;
+begin
+  Result := nil;
+  if Truemark = nil then
+    Exit;
+  CodesV := Truemark.GetValue('codes');
+  if CodesV is TJSONArray then
+  begin
+    Arr := TJSONArray(CodesV);
+    if (Arr.Count > 0) and (Arr.Items[0] is TJSONObject) then
+      Result := TJSONObject(Arr.Items[0]);
+  end;
+end;
+
+procedure TVariantPrint.AddTruemarkFields(PermObj, Truemark: TJSONObject);
+const
+  FieldNames: array[0..8] of string = (
+    'valid', 'verified', 'found', 'realizable', 'utilised',
+    'isBlocked', 'sold', 'isOwner', 'grayZone');
+var
+  TruemarkOut, CodeObj: TJSONObject;
+  I: Integer;
+  Val: string;
+begin
+  if PermObj = nil then
+    Exit;
+
+  CodeObj := ExtractFirstTruemarkCode(Truemark);
+  if (CodeObj = nil) and (Truemark = nil) then
+    Exit;
+
+  TruemarkOut := TJSONObject.Create;
+  try
+    for I := Low(FieldNames) to High(FieldNames) do
+    begin
+      Val := '';
+      if CodeObj <> nil then
+        Val := JStr(CodeObj, FieldNames[I], '');
+      if (Val = '') and (Truemark <> nil) then
+        Val := JStr(Truemark, FieldNames[I], '');
+      if Val <> '' then
+        TruemarkOut.AddPair(FieldNames[I], Val);
+    end;
+
+    if CodeObj <> nil then
+    begin
+      Val := JStr(CodeObj, 'message', '');
+      if Val <> '' then
+        TruemarkOut.AddPair('message', Val);
+      Val := JStr(CodeObj, 'errorCode', '');
+      if Val <> '' then
+        TruemarkOut.AddPair('errorCode', Val);
+      Val := JStr(CodeObj, 'cis', '');
+      if Val <> '' then
+        TruemarkOut.AddPair('cis', Val);
+      Val := JStr(CodeObj, 'gtin', '');
+      if Val <> '' then
+        TruemarkOut.AddPair('gtin', Val);
+    end;
+
+    if Truemark <> nil then
+    begin
+      Val := JStr(Truemark, 'description', '');
+      if Val <> '' then
+        TruemarkOut.AddPair('description', Val);
+      Val := JStr(Truemark, 'code', '');
+      if Val <> '' then
+        TruemarkOut.AddPair('truemarkCode', Val);
+    end;
+
+    if TruemarkOut.Count > 0 then
+      PermObj.AddPair('truemark', TruemarkOut)
+    else
+      TruemarkOut.Free;
+  except
+    TruemarkOut.Free;
+    raise;
+  end;
+end;
+
+function TVariantPrint.ParsePermissionCheckResponse(const ResponseBody: string): TJSONObject;
+var
+  V, TruemarkV: TJSONValue;
+  Root, Truemark: TJSONObject;
+  CodeStr, Err, Uuid, TimeStr, Inst, Version: string;
+  Accepted: Boolean;
+begin
+  Result := TJSONObject.Create;
+
+  V := TJSONObject.ParseJSONValue(ResponseBody);
+  if not (V is TJSONObject) then
+  begin
+    if V <> nil then
+      V.Free;
+    Result.AddPair('accepted', TJSONBool.Create(False));
+    Result.AddPair('code', '-1');
+    Result.AddPair('error', 'Некорректный JSON ответа FMU');
+    Exit;
+  end;
+
+  Root := TJSONObject(V);
+  try
+    CodeStr := JStr(Root, 'Code', '');
+    if CodeStr = '' then
+      CodeStr := JStr(Root, 'code', '');
+    Accepted := (CodeStr = '0') or SameText(CodeStr, '0.0');
+
+    Err := JStr(Root, 'Error', '');
+    if Err = '' then
+      Err := JStr(Root, 'error', '');
+
+    Uuid := '';
+    TimeStr := '';
+    Inst:= '';
+    Version:='';
+    TruemarkV := Root.GetValue('Truemark_response');
+    if TruemarkV = nil then
+      TruemarkV := Root.GetValue('truemark_response');
+    if TruemarkV is TJSONObject then
+    begin
+      Truemark := TJSONObject(TruemarkV);
+      Uuid := JStr(Truemark, 'reqId', '');
+      TimeStr := JStr(Truemark, 'reqTimestamp', '');
+      Inst := JStr(Truemark, 'inst', '');
+      Version := JStr(Truemark, 'version', '');
+      AddTruemarkFields(Result, Truemark);
+    end
+    else
+    begin
+      Uuid := JStr(Root, 'reqId', '');
+      TimeStr := JStr(Root, 'reqTimestamp', '');
+      Inst := JStr(Root, 'inst', '');
+      Version := JStr(Root, 'version', '');
+    end;
+
+    Result.AddPair('accepted', TJSONBool.Create(Accepted));
+    Result.AddPair('code', CodeStr);
+    Result.AddPair('error', Err);
+    Result.AddPair('uuid', Uuid);
+    Result.AddPair('time', TimeStr);
+    Result.AddPair('inst', Inst);
+    Result.AddPair('version', Version);
+  finally
+    Root.Free;
+  end;
+end;
+
+function TVariantPrint.CheckSingleMarkPermission(const MarkB64, Inn, Fn: string): TJSONObject;
+var
+  Url, ReqJson, RespBody: string;
+begin
+  if FEmulation then
+  begin
+    Result := TJSONObject.Create;
+    Result.AddPair('accepted', TJSONBool.Create(True));
+    Result.AddPair('code', '0');
+    Result.AddPair('error', '');
+    Result.AddPair('uuid', 'e25d1c5a-67b0-4581-81b7-e8691ef0575e');
+    Result.AddPair('time', '1729774577700');
+    Result.AddPair('inst', '123');
+    Result.AddPair('version', '2.1.4');
+    Exit;
+  end;
+
+  if Trim(Inn) = '' then
+    raise Exception.Create('ИНН не задан для проверки разрешительного режима');
+
+  ReqJson := BuildDocumentCheckJson(MarkB64, Inn, Fn);
+  Url := Format('http://%s:%d%s', [PERMISSION_FMU_HOST, PERMISSION_FMU_PORT, PERMISSION_FMU_PATH]);
+  FLog.LogInfo('POST /document (РР): ' + Url);
+
+  try
+    RespBody := HttpPostJson(Url, ReqJson);
+  except
+    on E: Exception do
+    begin
+      FLog.LogError('POST /document (РР): ' + E.Message);
+      Result := TJSONObject.Create;
+      Result.AddPair('accepted', TJSONBool.Create(False));
+      Result.AddPair('code', '-1');
+      Result.AddPair('error', E.Message);
+      Result.AddPair('uuid', '');
+      Result.AddPair('time', '');
+      Result.AddPair('inst', '');
+      Result.AddPair('version', '');
+      Exit;
+    end;
+  end;
+
+  FLog.LogInfo('POST /document (РР) ответ: ' + JsonBodyPreviewPlain(RespBody, 500));
+  Result := ParsePermissionCheckResponse(RespBody);
 end;
 
 function TVariantPrint.CheckMarkInternal(const Body: string): string;
@@ -1596,19 +2078,22 @@ var
   MarksB64: TArray<string>;
   MarksOut: TJSONArray;
   Root: TJSONObject;
-  MarkObj: TJSONObject;
+  MarkObj, PermObj: TJSONObject;
   ReturnCheck: Boolean;
-  CashierName: string;
+  CheckPermission: Boolean;
+  CashierName, PermissionInn, PermissionFn: string;
   I: Integer;
   MarkDecoded: string;
-  AllAccepted: Boolean;
-  Accepted: Boolean;
+  AllAccepted, AllPermissionAccepted, PermAccepted, Accepted: Boolean;
 begin
   V := TJSONObject.ParseJSONValue(Body);
   if not (V is TJSONObject) then
   begin
-    V.Free;
-    raise Exception.Create('Invalid JSON');
+    if V <> nil then
+      V.Free;
+    FLog.LogError(Format('CheckMarkInternal: Invalid JSON, bodyLen=%d, head=%s',
+      [Length(Body), JsonBodyPreview(Body)]));
+    raise Exception.Create(Format('Invalid JSON, bodyLen=%d', [Length(Body)]));
   end;
   Req := TJSONObject(V);
 
@@ -1618,7 +2103,14 @@ begin
 
     CollectMarksFromRequest(Req, MarksB64);
     ReturnCheck := GetReceiptReturnCheck(Req);
+    CheckPermission := JBool(Req, 'checkPermission', False);
     CashierName := JStr(Req, 'cashierName');
+
+    if CheckPermission and not ReturnCheck then
+    begin
+      PermissionInn := ResolvePermissionInn(Req);
+      PermissionFn := ResolvePermissionFn(Req);
+    end;
 
     EnsureSessionOpen(CashierName);
 
@@ -1626,6 +2118,7 @@ begin
     Root := TJSONObject.Create;
     try
       AllAccepted := True;
+      AllPermissionAccepted := True;
       for I := 0 to High(MarksB64) do
       begin
         MarkDecoded := DecodeMarkBase64(MarksB64[I]);
@@ -1634,6 +2127,26 @@ begin
 
         MarkObj := CheckSingleMark(MarkDecoded, ReturnCheck);
         try
+          if CheckPermission and not ReturnCheck then
+          begin
+            FLog.LogInfo(Format('Проверка РР [%d/%d]', [I + 1, Length(MarksB64)]));
+            PermObj := CheckSingleMarkPermission(MarksB64[I], PermissionInn, PermissionFn);
+            try
+              MarkObj.AddPair('permission', PermObj);
+              PermObj := nil;
+              PermAccepted := False;
+              if MarkObj.GetValue('permission') is TJSONObject then
+              begin
+                if TJSONObject(MarkObj.GetValue('permission')).GetValue('accepted') is TJSONBool then
+                  PermAccepted := TJSONBool(TJSONObject(MarkObj.GetValue('permission')).GetValue('accepted')).AsBoolean;
+              end;
+              if not PermAccepted then
+                AllPermissionAccepted := False;
+            finally
+              PermObj.Free;
+            end;
+          end;
+
           MarkObj.AddPair('index', TJSONNumber.Create(I));
           Accepted := False;
           if MarkObj.GetValue('accepted') is TJSONBool then
@@ -1652,8 +2165,14 @@ begin
       Root.AddPair('marks', MarksOut);
       MarksOut := nil;
       Root.AddPair('allAccepted', TJSONBool.Create(AllAccepted));
-      Result := Root.ToJSON;
-      FLog.LogInfo('CheckMarkInternal OK allAccepted=' + BoolToStr(AllAccepted, True));
+      if CheckPermission and not ReturnCheck then
+        Root.AddPair('allPermissionAccepted', TJSONBool.Create(AllPermissionAccepted));
+      Result := JsonToPlainText(Root);
+      if CheckPermission and not ReturnCheck then
+        FLog.LogInfo('CheckMarkInternal OK allAccepted=' + BoolToStr(AllAccepted, True) +
+          ', allPermissionAccepted=' + BoolToStr(AllPermissionAccepted, True))
+      else
+        FLog.LogInfo('CheckMarkInternal OK allAccepted=' + BoolToStr(AllAccepted, True));
       AfterCommand(Req);
     finally
       MarksOut.Free;
@@ -1738,7 +2257,11 @@ begin
   V := TJSONObject.ParseJSONValue(Body);
   try
     if not (V is TJSONObject) then
-      raise Exception.Create('Invalid JSON');
+    begin
+      FLog.LogError(Format('CheckMarkJson: Invalid JSON, bodyLen=%d, head=%s',
+        [Length(Body), JsonBodyPreview(Body)]));
+      raise Exception.Create(Format('Invalid JSON, bodyLen=%d', [Length(Body)]));
+    end;
     Req := TJSONObject(V);
 
     if JBool(Req, 'async', False) then
@@ -1786,7 +2309,7 @@ begin
     try
       Root.AddPair('taskId', TaskId);
       Root.AddPair('status', Entry.Status);
-      Result := Root.ToJSON;
+      Result := JsonToPlainText(Root);
     finally
       Root.Free;
     end;

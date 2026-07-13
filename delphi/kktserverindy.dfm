@@ -10,6 +10,7 @@ object kktServerIndyForm: TkktServerIndyForm
   Font.Height = -12
   Font.Name = 'Segoe UI'
   Font.Style = []
+  OnCreate = FormCreate
   OnDestroy = FormDestroy
   TextHeight = 15
   object HeaderLabel: TLabel
@@ -18,6 +19,15 @@ object kktServerIndyForm: TkktServerIndyForm
     Width = 160
     Height = 15
     Caption = #1050#1050#1058' '#1089#1077#1088#1074#1077#1088' '#1076#1083#1103' '#1087#1077#1095#1072#1090#1080' '#1095#1077#1082#1086#1074
+  end
+  object VersionLabel: TLabel
+    Left = 448
+    Top = 36
+    Width = 120
+    Height = 15
+    Caption = #1042#1077#1088#1089#1080#1103':'
+    Font.Color = clGrayText
+    ParentFont = False
   end
   object ButtonStartServer: TButton
     Left = 88

@@ -8,6 +8,8 @@
   GET/POST /kkt/...           — команды ККТ (Delphi kktserverindy)
 
 Примеры:
+  python proxy_1c_client_emulator.py health
+  python proxy_1c_client_emulator.py kkt-health
   python proxy_1c_client_emulator.py smoke
   python proxy_1c_client_emulator.py document
   python proxy_1c_client_emulator.py document --json rr.json
@@ -124,6 +126,9 @@ class Proxy1CClient:
 
         return HttpResponse(status=status, body=raw, json=parsed)
 
+    def health(self) -> HttpResponse:
+        return self._request("GET", "/health")
+
     def document(self, payload: dict[str, Any] | str) -> HttpResponse:
         return self._request("POST", "/document", payload, like_1c_document=True)
 
@@ -164,6 +169,43 @@ def sample_document_json(
     return payload
 
 
+def print_health_response(title: str, resp: HttpResponse) -> None:
+    print(f"\n=== {title} ===")
+    print(f"HTTP {resp.status}")
+    if resp.json is not None:
+        print(json.dumps(resp.json, ensure_ascii=False, indent=2))
+    else:
+        print(resp.body)
+
+    if resp.status != 200:
+        print("-> proxy недоступен (служба C# не отвечает)")
+        return
+
+    if resp.json is None:
+        print("-> HTTP 200, но тело не JSON")
+        return
+
+    kkt = resp.json.get("kkt") or {}
+    fmu = resp.json.get("fmu") or {}
+    proxy_version = resp.json.get("version")
+    if proxy_version:
+        print(f"-> Proxy C#: version={proxy_version}")
+
+    if kkt.get("reachable"):
+        kkt_version = kkt.get("version")
+        suffix = f" (version={kkt_version})" if kkt_version else ""
+        print(f"-> Delphi KKT: доступен{suffix}")
+    else:
+        err = kkt.get("error", "нет ответа")
+        print(f"-> Delphi KKT: недоступен — {err}")
+
+    if fmu.get("reachable"):
+        print("-> FMU: порт открыт")
+    else:
+        err = fmu.get("error", "нет ответа")
+        print(f"-> FMU: недоступен — {err}")
+
+
 def print_document_response(title: str, resp: HttpResponse) -> None:
     print(f"\n=== {title} ===")
     print(f"HTTP {resp.status}")
@@ -199,6 +241,20 @@ def run_smoke(client: Proxy1CClient, *, with_marking: bool) -> int:
     print("SMOKE: эмулятор клиента 1С через proxy")
     print(f"Proxy: {client.base_url}")
     print("=" * 70)
+
+    started = time.time()
+    resp = client.health()
+    print_health_response("GET /health (служба C# + проверка Delphi и FMU)", resp)
+    if resp.status != 200:
+        failed += 1
+    print(f"  Время HTTP: {fmt_duration(time.time() - started)}")
+
+    started = time.time()
+    resp = client.kkt_get("/health")
+    print_response("GET /kkt/health (напрямую через proxy → Delphi)", resp)
+    if resp.status != 200:
+        failed += 1
+    print(f"  Время HTTP: {fmt_duration(time.time() - started)}")
 
     started = time.time()
     resp = client.document(sample_document_json())
@@ -243,6 +299,7 @@ def run_smoke(client: Proxy1CClient, *, with_marking: bool) -> int:
 
     print("\n" + "=" * 70)
     print(f"Итог smoke: ошибок — {failed}")
+    print("Подсказка: GET /health — proxy C#; kkt.reachable=false — Delphi; fmu.reachable=false — FMU.")
     print("Подсказка: 500 на /kkt/* нормален, если Delphi KKT-сервер не запущен.")
     print("Ошибка на /document — проверьте FMU на :2578 и Content-Type в proxy.")
     print("=" * 70)
@@ -265,6 +322,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("health", help="GET /health — служба C# и доступность Delphi/FMU")
+    sub.add_parser("kkt-health", help="GET /kkt/health — health Delphi через proxy")
 
     smoke = sub.add_parser("smoke", help="Прогон /document и основных /kkt/*")
     smoke.add_argument("--with-marking", action="store_true", help="Чек с маркой")
@@ -299,6 +359,16 @@ def main(argv: list[str] | None = None) -> int:
     client = Proxy1CClient(host=args.host, port=args.port, timeout=args.timeout)
 
     try:
+        if args.command == "health":
+            resp = client.health()
+            print_health_response("GET /health", resp)
+            return 0 if resp.status == 200 else 1
+
+        if args.command == "kkt-health":
+            resp = client.kkt_get("/health")
+            print_response("GET /kkt/health", resp)
+            return 0 if resp.status == 200 and resp.ok else 1
+
         if args.command == "smoke":
             return run_smoke(client, with_marking=args.with_marking)
 

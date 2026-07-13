@@ -11,7 +11,10 @@ type
   TFmuHttpServer = class
   private
     FServer: TIdHTTPServer;
-    FVariantPrint: TVariantPrint; // или как у вас называется класс/объект
+    FVariantPrint: TVariantPrint;
+    FServiceName: string;
+    FServiceVersion: string;
+    function BuildHealthJson: string;
     procedure ServerCommandGet(AContext: TIdContext;
       ARequestInfo: TIdHTTPRequestInfo;
       AResponseInfo: TIdHTTPResponseInfo);
@@ -23,6 +26,7 @@ type
   protected FActive:boolean;
     function GetActive:boolean;
   public
+    class function ReadExeFileVersion: string;
     constructor Create(APort: Integer; AVariantPrint: TVariantPrint);
     destructor Destroy; override;
     procedure Start;
@@ -32,12 +36,57 @@ type
 
 implementation
 
+uses
+  Winapi.Windows;
+
+function JsonEscapeHealth(const S: string): string;
+begin
+  Result := S.Replace('\', '\\')
+             .Replace('"', '\"')
+             .Replace(#13, '\r')
+             .Replace(#10, '\n')
+             .Replace(#9, '\t');
+end;
+
 { TFmuHttpServer }
+
+class function TFmuHttpServer.ReadExeFileVersion: string;
+var
+  Size, Handle: DWORD;
+  Buffer: Pointer;
+  Value: PVSFixedFileInfo;
+  Len: UINT;
+begin
+  Result := '0.0.0.0';
+  Size := GetFileVersionInfoSize(PChar(ParamStr(0)), Handle);
+  if Size = 0 then
+    Exit;
+  GetMem(Buffer, Size);
+  try
+    if not GetFileVersionInfo(PChar(ParamStr(0)), 0, Size, Buffer) then
+      Exit;
+    if VerQueryValue(Buffer, '\', Pointer(Value), Len) then
+      Result := Format('%d.%d.%d.%d',
+        [HiWord(Value^.dwFileVersionMS), LoWord(Value^.dwFileVersionMS),
+         HiWord(Value^.dwFileVersionLS), LoWord(Value^.dwFileVersionLS)]);
+  finally
+    FreeMem(Buffer);
+  end;
+end;
+
+function TFmuHttpServer.BuildHealthJson: string;
+begin
+  Result := Format(
+    '{"result":1,"description":"OK","service":"%s","status":"up","version":"%s"}',
+    [JsonEscapeHealth(FServiceName), JsonEscapeHealth(FServiceVersion)]);
+end;
 
 constructor TFmuHttpServer.Create(APort: Integer; AVariantPrint: TVariantPrint);
 begin
   inherited Create;
   FVariantPrint := AVariantPrint;
+  FServiceName := 'kktserverindy';
+  FServiceVersion := ReadExeFileVersion;
   FServer := TIdHTTPServer.Create(nil);
   FServer.DefaultPort := APort;
   FServer.OnCommandGet := ServerCommandGet;
@@ -97,12 +146,11 @@ end;
 
 procedure TFmuHttpServer.WriteError(AResponseInfo: TIdHTTPResponseInfo;
   const AMessage: string; AStatusCode: Integer = 500);
-var
-  ErrJson: string;
 begin
-  ErrJson := Format('{"ok":false,"error":%s}',
-    [AnsiQuotedStr(AMessage, '"')]); // при необходимости замените на нормальный JSON-эскейпинг
-  WriteJson(AResponseInfo, ErrJson, AStatusCode);
+  // тот же контракт, что JsonError в uVariantPrint: result + description
+  WriteJson(AResponseInfo,
+    Format('{"result":0,"description":"%s"}', [JsonEscapeHealth(AMessage)]),
+    AStatusCode);
 end;
 
 procedure TFmuHttpServer.ServerCommandGet(AContext: TIdContext;
@@ -115,9 +163,19 @@ begin
   Body := '';
 
   try
-    if (Method = 'GET') and (Path = '/info') then
+    if (Method = 'GET') and (Path = '/health') then
+    begin
+      ResultJson := BuildHealthJson;
+      WriteJson(AResponseInfo, ResultJson);
+    end
+    else if (Method = 'GET') and (Path = '/info') then
     begin
       ResultJson := FVariantPrint.KktInfoJson;
+      WriteJson(AResponseInfo, ResultJson);
+    end
+    else if (Method = 'GET') and (Path = '/connection-status') then
+    begin
+      ResultJson := FVariantPrint.KktConnectionStatusJson;
       WriteJson(AResponseInfo, ResultJson);
     end
     else if (Method = 'POST') and (Path = '/print-check') then
@@ -144,9 +202,20 @@ begin
       ResultJson := FVariantPrint.CancelCheckJson(Body);
       WriteJson(AResponseInfo, ResultJson);
     end
+    else if (Method = 'POST') and (Path = '/connect') then
+    begin
+      ResultJson := FVariantPrint.ConnectJson;
+      WriteJson(AResponseInfo, ResultJson);
+    end
     else if (Method = 'POST') and (Path = '/disconnect') then
     begin
       ResultJson := FVariantPrint.DisconnectJson;
+      WriteJson(AResponseInfo, ResultJson);
+    end
+    else if (Method = 'POST') and (Path = '/clear-buffer-of-marks') then
+    begin
+      Body := ReadBody(ARequestInfo);
+      ResultJson := FVariantPrint.ClearBufferOfMarksJson(Body);
       WriteJson(AResponseInfo, ResultJson);
     end
     else if (Method = 'POST') and (Path = '/check-marks') then
