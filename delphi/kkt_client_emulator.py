@@ -25,6 +25,7 @@
   python kkt_client_emulator.py mark-cache-test
   python kkt_client_emulator.py mark-cache-test --scenario kkt-rr-cache
   python kkt_client_emulator.py mark-cache-test --scenario duplicate-check
+  python kkt_client_emulator.py mark-cache-test --scenario preflight-fail
   python kkt_client_emulator.py mark-cache-test --scenario cancel-reset
   python kkt_client_emulator.py check-marks --check-permission
 """
@@ -49,6 +50,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 2580
 DEFAULT_TIMEOUT = 180
 DEFAULT_MARK_RAW = "010460406000301021N4N57RDCUDVTL"
+# Sentinel эмуляции Delphi: CheckSingleMark → accepted=false (smoke этапа 4)
+FAIL_MARK_RAW = "FAIL_MARK_SMOKE_TEST"
 
 
 @dataclass
@@ -420,6 +423,7 @@ def run_mark_cache_test(
         "lazy-full-flow": _scenario_cache_lazy_full_flow,
         "kkt-rr-cache": _scenario_cache_kkt_rr,
         "preflight-print": _scenario_preflight_print,
+        "preflight-fail": _scenario_preflight_fail,
         "async-then-print": _scenario_async_then_print,
     }
     if scenario not in scenarios:
@@ -441,6 +445,7 @@ def run_mark_cache_test(
         "duplicate-check",
         "kkt-rr-cache",
         "preflight-print",
+        "preflight-fail",
         "async-then-print",
         "cancel-reset",
         "check-then-print",
@@ -812,6 +817,86 @@ def _scenario_preflight_print(
         print(f"  OK: печать из кэша быстрее ({fmt_duration(t2)} < {fmt_duration(t1)})")
     else:
         print(f"  NOTE: время 2={fmt_duration(t2)}, 1={fmt_duration(t1)}")
+
+    return failed
+
+
+def _scenario_preflight_fail(
+    client: KktServerClient,
+    *,
+    password: int,
+    mark_raw: str,
+    check_permission: bool = False,
+) -> int:
+    """Этап 4: print-check с FAIL_MARK → result=0, marks[] с ошибкой, чек не пробит.
+
+    Работает в Emulation=true (sentinel FAIL_MARK в CheckSingleMark).
+    Через proxy (:2579) — тот же JSON; в 1С — таблМарки из marks[].
+    """
+    del mark_raw, check_permission
+    print("СЦЕНАРИЙ: pre-flight FAIL (этап 4 — транспорт marks[])")
+    print("  Ожидание: result=0, marks[0].accepted=false, mark=base64, description")
+    print("  Sentinel: FAIL_MARK* (только emulation Delphi)\n")
+
+    failed = 0
+    client.cancel_check()
+
+    bad_mark = FAIL_MARK_RAW
+    payload = sample_receipt_mark_only(
+        password=password,
+        mark_raw=bad_mark,
+        mark_accepted=False,
+        include_permission=False,
+        check_permission=False,
+    )
+    payload["checkPermission"] = False
+    expected_b64 = encode_mark_base64(bad_mark)
+
+    print("Тело print-check (плохая марка):")
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    resp = client.print_check(payload)
+    print_response("POST /print-check (ожидаем result=0)", resp)
+
+    if resp.ok:
+        print("  ERR: ожидался result=0 (чек не должен печататься)")
+        return 1
+
+    data = resp.json or {}
+    if data.get("result") != 0:
+        print(f"  ERR: result={data.get('result')}, ожидался 0")
+        failed += 1
+
+    marks = data.get("marks")
+    if not isinstance(marks, list) or not marks:
+        print("  ERR: нет marks[] в ответе — транспорт этапа 4 сломан")
+        return 1
+
+    print(f"  OK: marks[] длина={len(marks)}")
+    m0 = marks[0] if isinstance(marks[0], dict) else {}
+    if m0.get("accepted") is not False:
+        print(f"  ERR: marks[0].accepted={m0.get('accepted')}, ожидался false")
+        failed += 1
+    else:
+        print("  OK: marks[0].accepted=false")
+
+    got_mark = m0.get("mark")
+    if got_mark != expected_b64:
+        print("  ERR: marks[0].mark не совпал с base64 FAIL_MARK")
+        print(f"       got={got_mark!r}")
+        print(f"       exp={expected_b64!r}")
+        failed += 1
+    else:
+        print("  OK: marks[0].mark = base64 (ключ сопоставления для 1С)")
+
+    desc = str(m0.get("description") or "")
+    if not desc:
+        print("  ERR: marks[0].description пуст")
+        failed += 1
+    else:
+        print(f"  OK: description={desc}")
+
+    if data.get("allAccepted") is not False:
+        print(f"  NOTE: allAccepted={data.get('allAccepted')} (ожидался false)")
 
     return failed
 
@@ -1410,10 +1495,11 @@ def build_parser() -> argparse.ArgumentParser:
             "lazy-full-flow",
             "kkt-rr-cache",
             "preflight-print",
+            "preflight-fail",
             "async-then-print",
         ],
         default="all",
-        help="Сценарий (по умолчанию all). Этап3: async-then-print",
+        help="Сценарий (по умолчанию all). Этап4: preflight-fail",
     )
     mark_cache.add_argument(
         "--mark",

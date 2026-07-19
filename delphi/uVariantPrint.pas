@@ -2044,6 +2044,20 @@ begin
 
   if FEmulation then
   begin
+    // Sentinel для smoke этапа 4: марка с префиксом FAIL_MARK → accepted=false, чек не печатается
+    if Pos('FAIL_MARK', MarkDecoded) = 1 then
+    begin
+      Result.AddPair('accepted', TJSONBool.Create(False));
+      Result.AddPair('resultCode', TJSONNumber.Create(401));
+      Result.AddPair('checkItemLocalResult', TJSONNumber.Create(0));
+      Result.AddPair('checkItemLocalError', TJSONNumber.Create(1));
+      Result.AddPair('markingType2', TJSONNumber.Create(0));
+      Result.AddPair('kmServerErrorCode', TJSONNumber.Create(0));
+      Result.AddPair('kmServerCheckingStatus', TJSONNumber.Create(0));
+      Result.AddPair('description', 'Отказ ККТ (emulation FAIL_MARK)');
+      UpsertMarkCacheKkt(MarkDecoded, ReturnCheck, False, 401, 'Отказ ККТ (emulation FAIL_MARK)');
+      Exit;
+    end;
     Result.AddPair('accepted', TJSONBool.Create(True));
     Result.AddPair('resultCode', TJSONNumber.Create(0));
     Result.AddPair('checkItemLocalResult', TJSONNumber.Create(15));

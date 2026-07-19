@@ -259,6 +259,7 @@ python kkt_client_emulator.py check-marks --check-permission
 |----------|---------------|
 | `kkt-rr-cache` | Два `check-marks` с РР: второй `(cached)`, тот же uuid |
 | `preflight-print` | `print-check` без check-marks — pre-flight; затем из кэша |
+| `preflight-fail` | `print-check` с `FAIL_MARK*` → `result=0` + `marks[]` (этап 4, Emulation) |
 | `async-then-print` | async check-marks → status → print из кэша (этап 3) |
 | `duplicate-check` | Два `check-marks`: второй из кэша |
 | `cancel-reset` | После `cancel-check` кэш сброшен |
@@ -269,9 +270,16 @@ python kkt_client_emulator.py check-marks --check-permission
 # Этап 2 — pre-flight
 python kkt_client_emulator.py mark-cache-test --scenario preflight-print
 python kkt_client_emulator.py print-check --mark-only --check-permission
+
+# Этап 4 — ошибка pre-flight + marks[] (нужен Emulation=true в Delphi)
+python kkt_client_emulator.py mark-cache-test --scenario preflight-fail
+# через proxy:
+python kkt_client_emulator.py mark-cache-test --scenario preflight-fail --port 2579
+# (если proxy слушает /kkt — см. base path клиента; обычно порт 2580 напрямую на Delphi)
 ```
 
 В логе Delphi ожидайте: `полностью из кэша (ККТ+РР) — skip`, `pre-flight begin`, `permission из кэша`.
+Для `preflight-fail`: `pre-flight FAIL`, `Отказ ККТ (emulation FAIL_MARK)`.
 
 ---
 
