@@ -2412,18 +2412,9 @@ function TVariantPrint.CheckSingleMarkPermission(const MarkB64, Inn, Fn: string)
 var
   Url, ReqJson, RespBody: string;
 begin
+  // Emulation влияет только на ККТ/ФР; РР всегда идёт на реальный FMU /document
   if FEmulation then
-  begin
-    Result := TJSONObject.Create;
-    Result.AddPair('accepted', TJSONBool.Create(True));
-    Result.AddPair('code', '0');
-    Result.AddPair('error', '');
-    Result.AddPair('uuid', 'e25d1c5a-67b0-4581-81b7-e8691ef0575e');
-    Result.AddPair('time', '1729774577700');
-    Result.AddPair('inst', '123');
-    Result.AddPair('version', '2.1.4');
-    Exit;
-  end;
+    FLog.LogInfo('РР: Emulation=true — фейковый ответ отключён, POST /document как обычно');
 
   if Trim(Inn) = '' then
     raise Exception.Create('ИНН не задан для проверки разрешительного режима');

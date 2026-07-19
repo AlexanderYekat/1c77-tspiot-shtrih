@@ -831,6 +831,7 @@ def _scenario_preflight_fail(
     """Этап 4: print-check с FAIL_MARK → result=0, marks[] с ошибкой, чек не пробит.
 
     Работает в Emulation=true (sentinel FAIL_MARK в CheckSingleMark).
+    РР при Emulation не фейкается — нужен живой FMU, иначе permission.accepted=false.
     Через proxy (:2579) — тот же JSON; в 1С — таблМарки из marks[].
     """
     del mark_raw, check_permission
