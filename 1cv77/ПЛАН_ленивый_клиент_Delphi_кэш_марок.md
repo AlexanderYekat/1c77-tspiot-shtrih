@@ -1,7 +1,7 @@
 # План: ленивый клиент 1С + Delphi как хранилище и оркестратор проверки марок
 
 **Дата:** 2026-07-12  
-**Статус:** черновик, к реализации  
+**Статус:** этапы 1–3 Delphi done (проверено эмулятором 2026-07-19); далее этап 4 / 1С  
 **Связанные документы:** `ПЛАН_доработка_1с_ккт.md`, `delphi/ТЗ_клиент_1cv77.md`, `delphi/ТЗ_print-check_json.md`
 
 ---
@@ -42,9 +42,9 @@ Delphi kktserverindy (кэш + проверка + печать)
 |-----------|------|------------|
 | Delphi `POST /check-marks` sync/async | ✅ | — |
 | Delphi `GET /check-marks/status` | ✅ | — |
-| Delphi `FAcceptedMarks` (только ККТ, bool) | ✅ | поля РР, ошибки, uuid/time |
-| Delphi `print-check` pre-flight по маркам | ❌ | проверка до печати, structured errors |
-| Delphi permission из кэша при печати | ❌ | сейчас только из JSON `permission` |
+| Delphi `FMarkCache` (ККТ + РР, uuid/time) | ✅ (этап 1) | — |
+| Delphi `print-check` pre-flight по маркам | ✅ (этап 2) | — |
+| Delphi permission из кэша при печати | ✅ (этап 2) | — |
 | 1С async при скане (`module-form-of-check`) | ✅ частично | poll + UI не доведены |
 | 1С блок РР перед печатью (723–759) | ✅ старый путь | убрать/заменить для внешней программы |
 | `razresh_regim_dialog_error` | ✅ | колонка ошибки ККТ |
@@ -91,9 +91,9 @@ Delphi kktserverindy (кэш + проверка + печать)
 
 ### 1.1. Структура записи кэша
 
-- [ ] Заменить `FAcceptedMarks: TDictionary<string, Byte>` на `FMarkCache: TDictionary<string, TMarkCacheEntry>`
-- [ ] Ключ: `MarkCacheKey(MarkDecoded, ReturnCheck)` → `"S|..."` / `"R|..."` (как сейчас)
-- [ ] Поля `TMarkCacheEntry`:
+- [x] Заменить `FAcceptedMarks: TDictionary<string, Byte>` на `FMarkCache: TDictionary<string, TMarkCacheEntry>`
+- [x] Ключ: `MarkCacheKey(MarkDecoded, ReturnCheck)` → `"S|..."` / `"R|..."` (как сейчас)
+- [x] Поля `TMarkCacheEntry`:
   - `KktAccepted: Boolean`
   - `KktResultCode: Integer`
   - `KktDescription: string`
@@ -105,26 +105,27 @@ Delphi kktserverindy (кэш + проверка + печать)
 
 ### 1.2. Обновление кэша
 
-- [ ] После успешной проверки в `CheckSingleMark` — записать KKT-поля
-- [ ] После `CheckSingleMarkPermission` — записать RR-поля (uuid, time, inst, version, ошибки)
-- [ ] В `CheckMarkInternal` после цикла по маркам — обновить кэш для каждой марки из `marks[]`
-- [ ] При cache hit в `CheckSingleMark` — возвращать результат **из записи кэша** (не только `accepted=true`)
+- [x] После успешной проверки в `CheckSingleMark` — записать KKT-поля
+- [x] После `CheckSingleMarkPermission` — записать RR-поля (uuid, time, inst, version, ошибки)
+- [x] В `CheckMarkInternal` после цикла по маркам — обновить кэш для каждой марки из `marks[]`
+- [x] При cache hit в `CheckSingleMark` — возвращать результат **из записи кэша** (не только `accepted=true`)
 
 ### 1.3. API чтения кэша (внутреннее)
 
-- [ ] `function TryGetMarkFromCache(MarkDecoded, ReturnCheck): TMarkCacheEntry`
-- [ ] `function IsMarkFullyOk(MarkDecoded, ReturnCheck, CheckPermission): Boolean`
+- [x] `function TryGetMarkFromCache(MarkDecoded, ReturnCheck): TMarkCacheEntry`
+- [x] `function IsMarkFullyOk(MarkDecoded, ReturnCheck, CheckPermission): Boolean`
   - ККТ accepted = true
   - если `CheckPermission` и не возврат → RR accepted = true и uuid/time заполнены
 
 ### 1.4. Сброс кэша
 
-- [ ] Сохранить текущее поведение: `ClearAcceptedMarksCache` после успешной печати, close-shift, cancel-check
-- [ ] Переименовать в `ClearMarkCache` (или аналог)
-- [ ] **Не** сбрасывать кэш при ошибке pre-flight print-check (марки уже проверены, результат известен)
+- [x] Сохранить текущее поведение: `ClearAcceptedMarksCache` после успешной печати, close-shift, cancel-check
+- [x] Переименовать в `ClearMarkCache` (или аналог)
+- [x] **Не** сбрасывать кэш при ошибке pre-flight print-check (марки уже проверены, результат известен)
 
-**Критерий завершения этапа 1:**  
-После sync `check-marks` повторный вызов для той же марки не ходит на ККТ/РР, а отдаёт данные из кэша с полями KKT + RR.
+**Критерий завершения этапа 1:** ✅  
+После sync `check-marks` повторный вызов для той же марки не ходит на ККТ/РР, а отдаёт данные из кэша с полями KKT + RR.  
+Проверено: `mark-cache-test --scenario kkt-rr-cache` / `duplicate-check` (2026-07-19).
 
 ---
 
@@ -134,13 +135,13 @@ Delphi kktserverindy (кэш + проверка + печать)
 
 ### 2.1. Pre-flight перед печатью
 
-- [ ] Новая процедура `EnsureMarksReadyForPrint(Req: TJSONObject): string` (JSON ошибки или пусто = OK)
-- [ ] Собрать все `mark` (base64) из `items[]` где `type=position`
-- [ ] Определить `ReturnCheck`, `CheckPermission` (из JSON или настройки: РР только для `sell`, не для `sellReturn`)
-- [ ] Для каждой марки:
-  - [ ] cache hit + fully ok → skip
-  - [ ] иначе → `CheckSingleMark` + при необходимости `CheckSingleMarkPermission`
-- [ ] Сформировать ответ при ошибках:
+- [x] Новая процедура `EnsureMarksReadyForPrint(Req: TJSONObject): string` (JSON ошибки или пусто = OK)
+- [x] Собрать все `mark` (base64) из `items[]` где `type=position`
+- [x] Определить `ReturnCheck`, `CheckPermission` (из JSON или настройки: РР только для `sell`, не для `sellReturn`)
+- [x] Для каждой марки:
+  - [x] cache hit + fully ok → skip
+  - [x] иначе → `CheckSingleMark` + при необходимости `CheckSingleMarkPermission`
+- [x] Сформировать ответ при ошибках:
 
 ```json
 {
@@ -164,22 +165,22 @@ Delphi kktserverindy (кэш + проверка + печать)
 }
 ```
 
-- [ ] При `result=0` — **не** вызывать `FNOperation` / не открывать чек на ККТ
+- [x] При `result=0` — **не** вызывать `FNOperation` / не открывать чек на ККТ
 
 ### 2.2. Печать с данными из кэша
 
-- [ ] В `RegisterReceiptItem`: если `permission` в JSON пуст — **подставить из кэша** по `MarkDecoded`
-- [ ] В `ProcessMarkingAfterFNOperation`: всегда `markAccepted=true` для марок, прошедших pre-flight
-- [ ] Логировать: «permission из кэша», «markAccepted из pre-flight»
+- [x] В `RegisterReceiptItem`: если `permission` в JSON пуст — **подставить из кэша** по `MarkDecoded`
+- [x] В `ProcessMarkingAfterFNOperation`: всегда `markAccepted=true` для марок, прошедших pre-flight
+- [x] Логировать: «permission из кэша», «markAccepted из pre-flight»
 
 ### 2.3. Флаг отключения pre-flight (опционально)
 
-- [ ] JSON `"skipMarkPreflight": true` — для отладки / «пробить всё равно» с стороны 1С (если понадобится)
+- [x] JSON `"skipMarkPreflight": true` — для отладки / «пробить всё равно» с стороны 1С (если понадобится)
 
-**Критерий завершения этапа 2:**  
-`python kkt_client_emulator.py print-check` с маркой без предварительного check-marks:
-- первая попытка → pre-flight проверяет и печатает (или ошибка structured)
-- вторая попытка (после успешного check-marks) → из кэша, быстрее
+**Критерий завершения этапа 2:** ✅  
+`python kkt_client_emulator.py mark-cache-test --scenario preflight-print` (2026-07-19, v2026.7.19.2):
+- первая попытка → pre-flight проверяет и печатает
+- вторая (после check-marks) → `pre-flight [1]: из кэша — skip`, `permission из кэша`
 
 ---
 
@@ -189,22 +190,23 @@ Delphi kktserverindy (кэш + проверка + печать)
 
 ### 3.1. Async check-marks
 
-- [ ] Убедиться, что после `StartAsyncCheckMark` результат в `FMarkTasks` содержит полный `marks[]` с permission
-- [ ] По завершении async — обновить `FMarkCache` (сейчас обновляется только через `CheckMarkInternal`, проверить цепочку)
+- [x] Убедиться, что после `StartAsyncCheckMark` результат в `FMarkTasks` содержит полный `marks[]` с permission
+- [x] По завершении async — обновить `FMarkCache` (через `CheckMarkInternal` в фоновом потоке под `FLock`)
 
 ### 3.2. Status endpoint
 
-- [ ] `GET /check-marks/status?taskId=...` — без изменений контракта
-- [ ] Документировать: 1С может не poll'ить — достаточно кэша при печати
+- [x] `GET /check-marks/status?taskId=...` — без изменений контракта
+- [x] Документировать: 1С может не poll'ить — достаточно кэша при печати (`API_KKT_SERVER.md` §11)
 
 ### 3.3. (Опционально) GET /kkt/marks-cache-status
 
 - [ ] Endpoint: передать `marks[]` base64 → ответ статуса из кэша без проверки
 - [ ] Нужен только если захотим UI «зелёная галочка» на форме без poll taskId
-- [ ] **Не в MVP** — отложить
+- [x] **Не в MVP** — отложить
 
-**Критерий завершения этапа 3:**  
-Async check-marks → poll status → кэш заполнен → print-check без повторной проверки.
+**Критерий завершения этапа 3:** ✅  
+Async check-marks → poll status → кэш заполнен → print-check без повторной проверки.  
+Проверено: `mark-cache-test --scenario async-then-print` (2026-07-19).
 
 ---
 
@@ -325,12 +327,12 @@ Async check-marks → poll status → кэш заполнен → print-check б
 
 ### 9.1. Delphi (emulator / smoke)
 
-- [ ] `check-marks` sync — одна марка, `allAccepted=true`, кэш заполнен
-- [ ] `check-marks` async — taskId, poll до completed, кэш заполнен
-- [ ] `print-check` без предварительного check-marks — pre-flight проверяет и печатает
-- [ ] `print-check` после check-marks — из кэша, без повторного FNCheckItemBarcode (по логу)
+- [x] `check-marks` sync — одна марка, `allAccepted=true`, кэш заполнен
+- [x] `check-marks` async — taskId, poll до completed, кэш заполнен
+- [x] `print-check` без предварительного check-marks — pre-flight проверяет и печатает
+- [x] `print-check` после check-marks — из кэша, без повторного FNCheckItemBarcode (по логу)
 - [ ] `print-check` с заведомо bad маркой — `result=0`, `marks[]` с ошибками, чек не пробит
-- [ ] РР: `checkPermission=true`, uuid/time в кэше, теги 126x уходят при печати
+- [x] РР: `checkPermission=true`, uuid/time в кэше, теги 126x уходят при печати
 - [ ] Возврат `sellReturn` — РР не проверяется
 - [ ] Рестарт Delphi — кэш пуст, pre-flight проверяет заново
 
@@ -347,7 +349,7 @@ Async check-marks → poll status → кэш заполнен → print-check б
 
 - [ ] Nefiskальnye stroki cheka — порядок и содержание как раньше
 - [ ] `close-shift`, `x-report`, `cancel-check` — работают
-- [ ] Очистка кэша после успешной печати
+- [x] Очистка кэша после успешной печати
 
 **Критерий завершения этапа 9:**  
 Все сценарии из §9.1–9.2 пройдены, задокументированы в `fr_elves_test.txt` или отдельном чек-листе.
@@ -357,13 +359,13 @@ Async check-marks → poll status → кэш заполнен → print-check б
 ## Порядок работ (рекомендуемый)
 
 ```text
-Этап 1 (Delphi: кэш)
+Этап 1 (Delphi: кэш)           ✅
     ↓
-Этап 2 (Delphi: pre-flight print-check)
+Этап 2 (Delphi: pre-flight)    ✅
     ↓
-Этап 3 (Delphi: async → кэш)
+Этап 3 (Delphi: async → кэш)   ✅
     ↓
-Этап 4 (proxy/1С транспорт — при необходимости)
+Этап 4 (proxy/1С транспорт)    ← сейчас
     ↓
 Этап 8 (1С: маппинг ошибок)
     ↓
@@ -381,9 +383,9 @@ Async check-marks → poll status → кэш заполнен → print-check б
 ## Итоговые критерии приёмки
 
 - [ ] 1С при печати шлёт только марки; Delphi сам проверяет и использует кэш
-- [ ] Повторная проверка уже OK марки не дублирует запросы к ККТ/РР (видно в логе Delphi)
+- [x] Повторная проверка уже OK марки не дублирует запросы к ККТ/РР (видно в логе Delphi)
 - [ ] При ошибке print-check 1С показывает `razresh_regim_dialog_error` с ошибками ККТ и РР по строкам
-- [ ] РР-теги (uuid/time) уходят в ФН при печати из кэша Delphi, без `permission` в JSON от 1С
+- [x] РР-теги (uuid/time) уходят в ФН при печати из кэша Delphi, без `permission` в JSON от 1С
 - [ ] Async при скане не блокирует форму
 - [ ] Старый режим DrvFR (`флаг = 0`) не сломан
 
@@ -412,7 +414,7 @@ Async check-marks → poll status → кэш заполнен → print-check б
 
 ## Чек-лист «готово к prod»
 
-- [ ] Этапы 1–2 (Delphi) — done
+- [x] Этапы 1–2 (Delphi) — done
 - [ ] Этапы 5, 7, 8 (1С) — done
 - [ ] Этап 9 — все сценарии green
 - [ ] Обновлён `fr_elves_test.txt` под новый поток

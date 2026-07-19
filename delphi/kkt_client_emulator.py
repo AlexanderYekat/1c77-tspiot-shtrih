@@ -23,8 +23,10 @@
   python kkt_client_emulator.py queue-test
   python kkt_client_emulator.py queue-test --scenario async-burst --count 5
   python kkt_client_emulator.py mark-cache-test
-  python kkt_client_emulator.py mark-cache-test --scenario check-then-print
+  python kkt_client_emulator.py mark-cache-test --scenario kkt-rr-cache
+  python kkt_client_emulator.py mark-cache-test --scenario duplicate-check
   python kkt_client_emulator.py mark-cache-test --scenario cancel-reset
+  python kkt_client_emulator.py check-marks --check-permission
 """
 
 from __future__ import annotations
@@ -142,6 +144,10 @@ class KktServerClient:
         query = urllib.parse.urlencode({"taskId": task_id})
         return self.request("GET", f"/check-marks/status?{query}")
 
+    # Алиасы старых имён (в CLI раньше было check-mark)
+    check_mark = check_marks
+    check_mark_status = check_marks_status
+
 
 def sample_receipt(
     *,
@@ -213,8 +219,9 @@ def mark_position_item(
     mark_raw: str,
     mark_accepted: bool = False,
     price: float = 50.0,
+    include_permission: bool = False,
 ) -> dict[str, Any]:
-    """Позиция с маркой для POST /print-check."""
+    """Позиция с маркой для POST /print-check (ленивый клиент: без permission по умолчанию)."""
     item: dict[str, Any] = {
         "type": "position",
         "name": name,
@@ -225,11 +232,12 @@ def mark_position_item(
         "paymentObject": "commodity",
         "paymentMethod": "fullPayment",
         "mark": encode_mark_base64(mark_raw),
-        "permission": {
+    }
+    if include_permission:
+        item["permission"] = {
             "uuid": "00000000-0000-0000-0000-000000000001",
             "time": "2026-07-05T10:00:00",
-        },
-    }
+        }
     if mark_accepted:
         item["markAccepted"] = True
     return item
@@ -242,8 +250,11 @@ def sample_receipt_mark_only(
     mark_accepted: bool = False,
     sell_return: bool = False,
     with_plain_item: bool = True,
+    include_permission: bool = False,
+    check_permission: bool | None = None,
+    skip_mark_preflight: bool = False,
 ) -> dict[str, Any]:
-    """Чек с одной маркированной позицией (ленивый клиент: markAccepted по умолчанию false)."""
+    """Чек с одной маркированной позицией (ленивый клиент: без markAccepted/permission)."""
     items: list[dict[str, Any]] = []
     if with_plain_item:
         items.append(
@@ -263,6 +274,7 @@ def sample_receipt_mark_only(
             name="Маркированный товар",
             mark_raw=mark_raw,
             mark_accepted=mark_accepted,
+            include_permission=include_permission,
         )
     )
     total = sum(
@@ -270,7 +282,7 @@ def sample_receipt_mark_only(
         for item in items
         if item.get("type") == "position"
     )
-    return {
+    payload: dict[str, Any] = {
         "type": "sellReturn" if sell_return else "sell",
         "taxationType": "usnIncome",
         "operator": {"name": "Емельянов Алексей Андреевич"},
@@ -279,6 +291,11 @@ def sample_receipt_mark_only(
         "total": total,
         "password": password,
     }
+    if check_permission is not None:
+        payload["checkPermission"] = check_permission
+    if skip_mark_preflight:
+        payload["skipMarkPreflight"] = True
+    return payload
 
 
 def sample_receipt_duplicate_mark(
@@ -305,13 +322,16 @@ def sample_receipt_duplicate_mark(
 
 
 def check_mark_response_cached(resp: HttpResponse) -> bool:
-    """True, если сервер вернул марку из кэша текущего чека (description OK (cached))."""
+    """True, если description марки содержит '(cached)' (ответ из FMarkCache)."""
     if not resp.json:
         return False
     marks = resp.json.get("marks")
     if isinstance(marks, list):
         for mark in marks:
-            if isinstance(mark, dict) and mark.get("description") == "OK (cached)":
+            if not isinstance(mark, dict):
+                continue
+            desc = str(mark.get("description") or "")
+            if "(cached)" in desc:
                 return True
     return False
 
@@ -327,23 +347,60 @@ def check_mark_response_all_accepted(resp: HttpResponse) -> bool:
     return resp.ok
 
 
+def check_mark_response_permission_ok(resp: HttpResponse) -> bool:
+    """True, если у всех marks есть permission.accepted=true и uuid/time."""
+    if not resp.json:
+        return False
+    if resp.json.get("allPermissionAccepted") is False:
+        return False
+    marks = resp.json.get("marks")
+    if not isinstance(marks, list) or not marks:
+        return False
+    for mark in marks:
+        if not isinstance(mark, dict):
+            return False
+        perm = mark.get("permission")
+        if not isinstance(perm, dict):
+            return False
+        if perm.get("accepted") is not True:
+            return False
+        if not str(perm.get("uuid") or "").strip():
+            return False
+        if not str(perm.get("time") or "").strip():
+            return False
+    return True
+
+
 def run_check_mark_sync(
     client: KktServerClient,
     *,
-    marks_raw: list[str],
+    mark_raw: str | None = None,
+    marks_raw: list[str] | None = None,
     label: str,
+    check_permission: bool = False,
+    inn: str = "",
+    fn_number: str = "",
 ) -> tuple[HttpResponse, float]:
     """POST /check-marks (sync), возвращает ответ и длительность HTTP."""
-    payload = sample_check_mark_payload(marks_raw=marks_raw, async_mode=False)
+    if marks_raw is None:
+        marks_raw = [mark_raw if mark_raw is not None else DEFAULT_MARK_RAW]
+    payload = sample_check_mark_payload(
+        marks_raw=marks_raw,
+        async_mode=False,
+        check_permission=check_permission,
+        inn=inn,
+        fn_number=fn_number,
+    )
     started = time.time()
     resp = client.check_marks(payload)
     elapsed = time.time() - started
     print_response(label, resp)
     print(f"  Время HTTP: {fmt_duration(elapsed)}")
-    if check_marks_response_cached(resp):
-        print("  -> марка из кэша сервера (OK cached)")
+    if check_mark_response_cached(resp):
+        print("  -> марка из кэша сервера (description содержит '(cached)')")
+    if check_permission and check_mark_response_permission_ok(resp):
+        print("  -> permission OK (uuid/time заполнены)")
     return resp, elapsed
-    
 
 def run_mark_cache_test(
     client: KktServerClient,
@@ -351,8 +408,9 @@ def run_mark_cache_test(
     password: int,
     scenario: str,
     mark_raw: str,
+    check_permission: bool = False,
 ) -> int:
-    """Тесты серверного кэша принятых марок в рамках одного чека."""
+    """Тесты серверного кэша марок (ККТ + опционально РР) в рамках одного чека."""
     scenarios = {
         "all": None,
         "check-then-print": _scenario_cache_check_then_print,
@@ -360,13 +418,18 @@ def run_mark_cache_test(
         "duplicate-items": _scenario_cache_duplicate_items,
         "cancel-reset": _scenario_cache_cancel_reset,
         "lazy-full-flow": _scenario_cache_lazy_full_flow,
+        "kkt-rr-cache": _scenario_cache_kkt_rr,
+        "preflight-print": _scenario_preflight_print,
+        "async-then-print": _scenario_async_then_print,
     }
     if scenario not in scenarios:
         raise ValueError(f"Неизвестный сценарий: {scenario}")
 
     print("\n" + "=" * 70)
-    print("ТЕСТ КЭША ПРИНЯТЫХ МАРОК (вариант A)")
-    print("Смотрите kktserver.log: «OK (cached)», «markAccepted не указан, но марка уже принята»")
+    print("ТЕСТ КЭША МАРОК (FMarkCache) + pre-flight print-check")
+    print("Смотрите kktserver.log: «из кэша», «pre-flight», «permission из кэша»")
+    if check_permission:
+        print("Режим: checkPermission=true (ККТ + РР)")
     print("=" * 70)
 
     resp = client.info()
@@ -375,17 +438,27 @@ def run_mark_cache_test(
         return 1
 
     to_run = [
-        "check-then-print",
         "duplicate-check",
-        "duplicate-items",
+        "kkt-rr-cache",
+        "preflight-print",
+        "async-then-print",
         "cancel-reset",
+        "check-then-print",
+        "duplicate-items",
         "lazy-full-flow",
     ] if scenario == "all" else [scenario]
 
+    # kkt-rr-cache всегда с РР; остальные — по флагу --check-permission
     failed = 0
     for name in to_run:
         print("\n" + "-" * 70)
-        err = scenarios[name](client, password=password, mark_raw=mark_raw)
+        use_rr = check_permission or (name == "kkt-rr-cache")
+        err = scenarios[name](
+            client,
+            password=password,
+            mark_raw=mark_raw,
+            check_permission=use_rr,
+        )
         failed += err
 
     print("\n" + "=" * 70)
@@ -399,14 +472,23 @@ def _scenario_cache_check_then_print(
     *,
     password: int,
     mark_raw: str,
+    check_permission: bool = False,
 ) -> int:
     """check-marks → print-check без markAccepted (ленивый клиент)."""
     print("СЦЕНАРИЙ: check-marks, затем print-check без markAccepted")
     print("  Ожидание: печать использует кэш, полный цикл FNCheckItemBarcode не повторяется.\n")
 
     failed = 0
-    resp1, _ = run_check_mark_sync(client, mark_raw=mark_raw, label="POST /check-mark (1)")
+    resp1, _ = run_check_mark_sync(
+        client,
+        mark_raw=mark_raw,
+        label="POST /check-marks (1)",
+        check_permission=check_permission,
+    )
     if not check_mark_response_all_accepted(resp1):
+        failed += 1
+    if check_permission and not check_mark_response_permission_ok(resp1):
+        print("  ERR: ожидался permission OK")
         failed += 1
 
     payload = sample_receipt_mark_only(password=password, mark_raw=mark_raw, mark_accepted=False)
@@ -425,30 +507,48 @@ def _scenario_cache_duplicate_check(
     *,
     password: int,
     mark_raw: str,
+    check_permission: bool = False,
 ) -> int:
-    """Два check-mark подряд — второй должен быть из кэша."""
+    """Два check-marks подряд — второй должен быть из кэша."""
     del password
-    print("СЦЕНАРИЙ: два POST /check-mark одной марки подряд")
-    print("  Ожидание: второй ответ — description OK (cached), быстрее первого.\n")
+    print("СЦЕНАРИЙ: два POST /check-marks одной марки подряд")
+    print("  Ожидание: второй ответ — description содержит '(cached)', быстрее первого.\n")
 
     failed = 0
-    resp1, t1 = run_check_mark_sync(client, mark_raw=mark_raw, label="POST /check-mark (1, полная проверка)")
+    resp1, t1 = run_check_mark_sync(
+        client,
+        mark_raw=mark_raw,
+        label="POST /check-marks (1, полная проверка)",
+        check_permission=check_permission,
+    )
     if not check_mark_response_all_accepted(resp1):
         failed += 1
     if check_mark_response_cached(resp1):
-        print("  WARN: первый check-mark не должен быть из кэша")
+        print("  WARN: первый check-marks не должен быть из кэша")
+        failed += 1
+    if check_permission and not check_mark_response_permission_ok(resp1):
+        print("  ERR: у первого ответа нет permission uuid/time")
         failed += 1
 
-    resp2, t2 = run_check_mark_sync(client, mark_raw=mark_raw, label="POST /check-mark (2, из кэша)")
+    resp2, t2 = run_check_mark_sync(
+        client,
+        mark_raw=mark_raw,
+        label="POST /check-marks (2, из кэша)",
+        check_permission=check_permission,
+    )
     if not check_mark_response_all_accepted(resp2):
         failed += 1
     if not check_mark_response_cached(resp2):
-        print("  ERR: второй check-mark должен быть OK (cached)")
+        print("  ERR: второй check-marks должен содержать '(cached)' в description")
+        failed += 1
+    if check_permission and not check_mark_response_permission_ok(resp2):
+        print("  ERR: у второго ответа нет permission из кэша")
         failed += 1
     if t2 >= t1:
         print(f"  NOTE: второй ({fmt_duration(t2)}) не быстрее первого ({fmt_duration(t1)}) — на ККТ может быть иначе")
+    else:
+        print(f"  OK: второй быстрее ({fmt_duration(t2)} < {fmt_duration(t1)})")
 
-    # Закрываем «висящий» чек после двух check-mark без print-check
     resp_cancel = client.cancel_check()
     print_response("POST /cancel-check (очистка после сценария)", resp_cancel)
     if not resp_cancel.ok:
@@ -462,8 +562,10 @@ def _scenario_cache_duplicate_items(
     *,
     password: int,
     mark_raw: str,
+    check_permission: bool = False,
 ) -> int:
     """Один print-check, две позиции с одной маркой без markAccepted."""
+    del check_permission
     print("СЦЕНАРИЙ: print-check с двумя позициями и одной маркой")
     print("  Ожидание: полный цикл только для первой позиции, вторая — из кэша.\n")
 
@@ -480,14 +582,20 @@ def _scenario_cache_cancel_reset(
     *,
     password: int,
     mark_raw: str,
+    check_permission: bool = False,
 ) -> int:
-    """check-mark → cancel-check → check-mark — кэш сброшен, второй не cached."""
+    """check-marks → cancel-check → check-marks — кэш сброшен, второй не cached."""
     del password
-    print("СЦЕНАРИЙ: check-mark → cancel-check → check-mark")
-    print("  Ожидание: после cancel второй check-mark снова полная проверка (не cached).\n")
+    print("СЦЕНАРИЙ: check-marks -> cancel-check -> check-marks")
+    print("  Ожидание: после cancel второй check-marks снова полная проверка (не cached).\n")
 
     failed = 0
-    resp1, _ = run_check_mark_sync(client, mark_raw=mark_raw, label="POST /check-mark (до cancel)")
+    resp1, _ = run_check_mark_sync(
+        client,
+        mark_raw=mark_raw,
+        label="POST /check-marks (до cancel)",
+        check_permission=check_permission,
+    )
     if not check_mark_response_all_accepted(resp1):
         failed += 1
 
@@ -496,11 +604,16 @@ def _scenario_cache_cancel_reset(
     if not resp_cancel.ok:
         failed += 1
 
-    resp2, _ = run_check_mark_sync(client, mark_raw=mark_raw, label="POST /check-mark (после cancel)")
+    resp2, _ = run_check_mark_sync(
+        client,
+        mark_raw=mark_raw,
+        label="POST /check-marks (после cancel)",
+        check_permission=check_permission,
+    )
     if not check_mark_response_all_accepted(resp2):
         failed += 1
     if check_mark_response_cached(resp2):
-        print("  ERR: после cancel-check марка не должна быть OK (cached)")
+        print("  ERR: после cancel-check марка не должна быть из кэша")
         failed += 1
 
     resp_cancel2 = client.cancel_check()
@@ -516,27 +629,260 @@ def _scenario_cache_lazy_full_flow(
     *,
     password: int,
     mark_raw: str,
+    check_permission: bool = False,
 ) -> int:
     """Полный «ленивый» сценарий: check → check (cached) → print (без markAccepted) → OK."""
     print("СЦЕНАРИЙ: полный поток ленивого клиента")
-    print("  check-mark → check-mark (cached) → print-check без markAccepted\n")
+    print("  check-marks -> check-marks (cached) -> print-check без markAccepted\n")
 
     failed = 0
-    resp1, _ = run_check_mark_sync(client, mark_raw=mark_raw, label="1) POST /check-mark")
+    resp1, _ = run_check_mark_sync(
+        client,
+        mark_raw=mark_raw,
+        label="1) POST /check-marks",
+        check_permission=check_permission,
+    )
     if not check_mark_response_all_accepted(resp1):
         failed += 1
 
-    resp2, _ = run_check_mark_sync(client, mark_raw=mark_raw, label="2) POST /check-mark (повтор)")
+    resp2, _ = run_check_mark_sync(
+        client,
+        mark_raw=mark_raw,
+        label="2) POST /check-marks (повтор)",
+        check_permission=check_permission,
+    )
     if not check_mark_response_all_accepted(resp2):
         failed += 1
     if not check_mark_response_cached(resp2):
-        print("  ERR: повторный check-mark должен быть OK (cached)")
+        print("  ERR: повторный check-marks должен быть из кэша")
         failed += 1
 
     payload = sample_receipt_mark_only(password=password, mark_raw=mark_raw, mark_accepted=False)
     resp3 = client.print_check(payload)
     print_response("3) POST /print-check (без markAccepted)", resp3)
     if not resp3.ok:
+        failed += 1
+
+    return failed
+
+
+def _scenario_cache_kkt_rr(
+    client: KktServerClient,
+    *,
+    password: int,
+    mark_raw: str,
+    check_permission: bool = True,
+) -> int:
+    """Этап 1 ТЗ: sync check-marks с РР дважды — второй без ККТ/РР, из FMarkCache."""
+    del password
+    check_permission = True
+    print("СЦЕНАРИЙ: кэш ККТ+РР (этап 1)")
+    print("  1) check-marks checkPermission=true — полная проверка")
+    print("  2) check-marks checkPermission=true — из кэша (KKT+RR)")
+    print("  Смотрите лог: «полностью из кэша (ККТ+РР) — skip»\n")
+
+    failed = 0
+    resp1, t1 = run_check_mark_sync(
+        client,
+        mark_raw=mark_raw,
+        label="POST /check-marks (1, ККТ+РР)",
+        check_permission=True,
+    )
+    if not check_mark_response_all_accepted(resp1):
+        print("  ERR: allAccepted ожидался true")
+        failed += 1
+    if not check_mark_response_permission_ok(resp1):
+        print("  ERR: permission uuid/time обязательны после первой проверки")
+        failed += 1
+    if check_mark_response_cached(resp1):
+        print("  WARN: первый ответ не должен быть из кэша")
+        failed += 1
+
+    uuid1 = ""
+    if resp1.json and isinstance(resp1.json.get("marks"), list) and resp1.json["marks"]:
+        perm = resp1.json["marks"][0].get("permission") or {}
+        if isinstance(perm, dict):
+            uuid1 = str(perm.get("uuid") or "")
+
+    resp2, t2 = run_check_mark_sync(
+        client,
+        mark_raw=mark_raw,
+        label="POST /check-marks (2, из FMarkCache)",
+        check_permission=True,
+    )
+    if not check_mark_response_all_accepted(resp2):
+        failed += 1
+    if not check_mark_response_cached(resp2):
+        print("  ERR: второй ответ должен быть из кэша ('(cached)' в description)")
+        failed += 1
+    if not check_mark_response_permission_ok(resp2):
+        print("  ERR: permission должен прийти из кэша")
+        failed += 1
+
+    uuid2 = ""
+    if resp2.json and isinstance(resp2.json.get("marks"), list) and resp2.json["marks"]:
+        perm = resp2.json["marks"][0].get("permission") or {}
+        if isinstance(perm, dict):
+            uuid2 = str(perm.get("uuid") or "")
+    if uuid1 and uuid2 and uuid1 != uuid2:
+        print(f"  ERR: uuid РР изменился ({uuid1} -> {uuid2}), ожидали тот же из кэша")
+        failed += 1
+    elif uuid1 and uuid2:
+        print(f"  OK: uuid РР совпал ({uuid1[:8]}...)")
+
+    if t2 < t1:
+        print(f"  OK: второй быстрее ({fmt_duration(t2)} < {fmt_duration(t1)})")
+    else:
+        print(f"  NOTE: время 2={fmt_duration(t2)}, 1={fmt_duration(t1)}")
+
+    resp_cancel = client.cancel_check()
+    print_response("POST /cancel-check (очистка)", resp_cancel)
+    if not resp_cancel.ok:
+        failed += 1
+
+    return failed
+
+
+def _scenario_preflight_print(
+    client: KktServerClient,
+    *,
+    password: int,
+    mark_raw: str,
+    check_permission: bool = False,
+) -> int:
+    """Этап 2: print-check без предварительного check-marks — pre-flight сам проверяет."""
+    print("СЦЕНАРИЙ: pre-flight print-check (этап 2)")
+    print("  1) print-check без check-marks, без permission/markAccepted")
+    print("  2) check-marks, затем print-check (из кэша)")
+    print("  Смотрите лог: «pre-flight begin», «permission из кэша»\n")
+
+    failed = 0
+    # Сброс кэша на случай предыдущих тестов
+    client.cancel_check()
+
+    payload1 = sample_receipt_mark_only(
+        password=password,
+        mark_raw=mark_raw,
+        mark_accepted=False,
+        include_permission=False,
+        check_permission=True if check_permission else None,
+    )
+    # По умолчанию Delphi включает checkPermission для sell; явно для ясности:
+    payload1["checkPermission"] = True
+    print("Тело print-check #1 (ленивый, без permission):")
+    print(json.dumps(payload1, ensure_ascii=False, indent=2))
+    t0 = time.time()
+    resp1 = client.print_check(payload1)
+    t1 = time.time() - t0
+    print_response("1) POST /print-check (pre-flight проверяет)", resp1)
+    print(f"  Время HTTP: {fmt_duration(t1)}")
+    if not resp1.ok:
+        print("  ERR: pre-flight+печать должны пройти в эмуляции")
+        failed += 1
+        if resp1.json and resp1.json.get("marks"):
+            print("  (structured marks[] при ошибке — OK для контракта)")
+
+    # После успешной печати кэш сброшен — check + print снова
+    resp_cm, _ = run_check_mark_sync(
+        client,
+        mark_raw=mark_raw,
+        label="2a) POST /check-marks (заполнить кэш)",
+        check_permission=True,
+    )
+    if not check_mark_response_all_accepted(resp_cm):
+        failed += 1
+    if not check_mark_response_permission_ok(resp_cm):
+        failed += 1
+
+    payload2 = sample_receipt_mark_only(
+        password=password,
+        mark_raw=mark_raw,
+        mark_accepted=False,
+        include_permission=False,
+    )
+    payload2["checkPermission"] = True
+    t0 = time.time()
+    resp2 = client.print_check(payload2)
+    t2 = time.time() - t0
+    print_response("2b) POST /print-check (марки уже в кэше)", resp2)
+    print(f"  Время HTTP: {fmt_duration(t2)}")
+    if not resp2.ok:
+        failed += 1
+    if t2 < t1:
+        print(f"  OK: печать из кэша быстрее ({fmt_duration(t2)} < {fmt_duration(t1)})")
+    else:
+        print(f"  NOTE: время 2={fmt_duration(t2)}, 1={fmt_duration(t1)}")
+
+    return failed
+
+
+def _scenario_async_then_print(
+    client: KktServerClient,
+    *,
+    password: int,
+    mark_raw: str,
+    check_permission: bool = False,
+) -> int:
+    """Этап 3: async check-marks -> poll status -> print-check из FMarkCache."""
+    del check_permission
+    print("СЦЕНАРИЙ: async check-marks -> status -> print-check (этап 3)")
+    print("  Ожидание: после completed кэш заполнен, pre-flight print: из кэша — skip")
+    print("  Смотрите лог: «async check-marks: completed», «pre-flight [1]: из кэша»\n")
+
+    failed = 0
+    client.cancel_check()
+
+    payload = sample_check_mark_payload(
+        marks_raw=[mark_raw],
+        async_mode=True,
+        check_permission=True,
+    )
+    print("Тело async check-marks:")
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    resp_async = client.check_marks(payload)
+    print_response("1) POST /check-marks async", resp_async)
+    if not resp_async.ok or not resp_async.json or not resp_async.json.get("taskId"):
+        print("  ERR: ожидался taskId")
+        return 1
+
+    task_id = str(resp_async.json["taskId"])
+    print(f"\nОжидание taskId={task_id} ...")
+    resp_status = wait_async_check_mark(client, task_id, timeout=180)
+    print_response("2) GET /check-marks/status", resp_status)
+    if not resp_status.ok:
+        failed += 1
+    status = (resp_status.json or {}).get("status")
+    if status != "completed":
+        print(f"  ERR: status={status}, ожидался completed")
+        failed += 1
+    if not check_mark_response_all_accepted(resp_status):
+        print("  ERR: allAccepted после async")
+        failed += 1
+    if not check_mark_response_permission_ok(resp_status):
+        print("  ERR: permission uuid/time после async")
+        failed += 1
+
+    # Повторный sync должен быть из кэша (доказательство FMarkCache)
+    resp_sync, _ = run_check_mark_sync(
+        client,
+        mark_raw=mark_raw,
+        label="3) POST /check-marks sync (должен быть cached)",
+        check_permission=True,
+    )
+    if not check_mark_response_cached(resp_sync):
+        print("  ERR: после async кэш пуст — sync не cached")
+        failed += 1
+
+    payload_print = sample_receipt_mark_only(
+        password=password,
+        mark_raw=mark_raw,
+        mark_accepted=False,
+        include_permission=False,
+    )
+    payload_print["checkPermission"] = True
+    resp_print = client.print_check(payload_print)
+    print_response("4) POST /print-check (из кэша после async)", resp_print)
+    if not resp_print.ok:
         failed += 1
 
     return failed
@@ -568,6 +914,9 @@ def sample_check_mark_payload(
     sell_return: bool = False,
     async_mode: bool = False,
     cashier_name: str = "",
+    check_permission: bool = False,
+    inn: str = "",
+    fn_number: str = "",
 ) -> dict[str, Any]:
     if marks_raw is None:
         marks_raw = [DEFAULT_MARK_RAW]
@@ -579,6 +928,12 @@ def sample_check_mark_payload(
     }
     if cashier_name:
         payload["cashierName"] = cashier_name
+    if check_permission:
+        payload["checkPermission"] = True
+    if inn:
+        payload["inn"] = inn
+    if fn_number:
+        payload["fnNumber"] = fn_number
     if len(marks_b64) == 1:
         payload["mark"] = marks_b64[0]
     else:
@@ -589,7 +944,7 @@ def sample_check_mark_payload(
 def wait_async_check_mark(client: KktServerClient, task_id: str, timeout: int = 180) -> HttpResponse:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        resp = client.check_mark_status(task_id)
+        resp = client.check_marks_status(task_id)
         if resp.json is None:
             return resp
         status = resp.json.get("status")
@@ -958,13 +1313,32 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Чек возврата: type=sellReturn (CheckType=2)",
     )
+    print_cmd.add_argument(
+        "--no-permission",
+        action="store_true",
+        help="Не добавлять permission в позицию (ленивый клиент / pre-flight)",
+    )
+    print_cmd.add_argument(
+        "--check-permission",
+        action="store_true",
+        help="В корень чека: checkPermission=true",
+    )
+    print_cmd.add_argument(
+        "--skip-mark-preflight",
+        action="store_true",
+        help="skipMarkPreflight=true — не проверять марки перед печатью",
+    )
 
     sub.add_parser("close-shift", help="POST /close-shift — закрытие смены (Z-отчёт)")
     sub.add_parser("x-report", help="POST /x-report — X-отчёт без гашения")
     sub.add_parser("cancel-check", help="POST /cancel-check — отмена открытого чека")
     sub.add_parser("disconnect", help="POST /disconnect — отключение от ККТ")
 
-    check_mark = sub.add_parser("check-mark", help="POST /check-mark — проверка марки(ок)")
+    check_mark = sub.add_parser(
+        "check-marks",
+        aliases=["check-mark"],
+        help="POST /check-marks — проверка марки(ок)",
+    )
     check_mark.add_argument("--mark", help="Марка в открытом виде (будет закодирована в base64)")
     check_mark.add_argument("--mark-b64", help="Марка уже в base64")
     check_mark.add_argument(
@@ -973,18 +1347,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Возврат: type=sellReturn (ItemStatus=3)",
     )
     check_mark.add_argument("--async", dest="async_mode", action="store_true", help="Асинхронная проверка")
+    check_mark.add_argument(
+        "--check-permission",
+        action="store_true",
+        help="checkPermission=true — дополнительно проверка РР (FMU)",
+    )
+    check_mark.add_argument("--inn", default="", help="ИНН для РР (если пусто — с ККТ)")
+    check_mark.add_argument("--fn", dest="fn_number", default="", help="Номер ФН для РР")
     check_mark.add_argument("--cashier", default="", help="Имя кассира при открытии смены")
     check_mark.add_argument("--wait", type=int, default=180, help="Таймаут ожидания async, сек")
 
-    check_status = sub.add_parser("check-mark-status", help="GET /check-mark/status — статус async-задачи")
-    check_status.add_argument("task_id", help="taskId из POST /check-mark")
+    check_status = sub.add_parser(
+        "check-marks-status",
+        aliases=["check-mark-status"],
+        help="GET /check-marks/status — статус async-задачи",
+    )
+    check_status.add_argument("task_id", help="taskId из POST /check-marks")
 
     smoke = sub.add_parser("smoke", help="Полный прогон всех endpoints")
     smoke.add_argument("--with-marking", action="store_true", help="Печатать чек с маркой")
 
     queue_test = sub.add_parser(
         "queue-test",
-        help="Тест очереди команд: sync/async check-mark и print-check",
+        help="Тест очереди команд: sync/async check-marks и print-check",
     )
     queue_test.add_argument(
         "--scenario",
@@ -1012,7 +1397,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     mark_cache = sub.add_parser(
         "mark-cache-test",
-        help="Тест кэша принятых марок: ленивый клиент, дедуп, cancel-reset",
+        help="Тест FMarkCache: duplicate-check, kkt-rr-cache, cancel-reset, ...",
     )
     mark_cache.add_argument(
         "--scenario",
@@ -1023,14 +1408,22 @@ def build_parser() -> argparse.ArgumentParser:
             "duplicate-items",
             "cancel-reset",
             "lazy-full-flow",
+            "kkt-rr-cache",
+            "preflight-print",
+            "async-then-print",
         ],
         default="all",
-        help="Сценарий (по умолчанию all — все подряд)",
+        help="Сценарий (по умолчанию all). Этап3: async-then-print",
     )
     mark_cache.add_argument(
         "--mark",
         default=DEFAULT_MARK_RAW,
         help="Тестовая марка (будет закодирована в base64)",
+    )
+    mark_cache.add_argument(
+        "--check-permission",
+        action="store_true",
+        help="Во всех сценариях передавать checkPermission=true",
     )
 
     return parser
@@ -1067,6 +1460,8 @@ def main(argv: list[str] | None = None) -> int:
                     mark_raw=args.mark,
                     mark_accepted=args.mark_accepted,
                     sell_return=args.sell_return,
+                    include_permission=False,
+                    skip_mark_preflight=args.skip_mark_preflight,
                 )
             else:
                 payload = sample_receipt(
@@ -1076,6 +1471,15 @@ def main(argv: list[str] | None = None) -> int:
                     sell_return=args.sell_return,
                     mark_raw=args.mark,
                 )
+            if getattr(args, "no_permission", False) and args.with_marking and not args.mark_only:
+                # Убрать permission из позиций, если чек собран через sample_receipt
+                for it in payload.get("items", []):
+                    if isinstance(it, dict):
+                        it.pop("permission", None)
+            if args.check_permission:
+                payload["checkPermission"] = True
+            if args.skip_mark_preflight:
+                payload["skipMarkPreflight"] = True
             print("Тело запроса:")
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             resp = client.print_check(payload)
@@ -1102,7 +1506,7 @@ def main(argv: list[str] | None = None) -> int:
             print_response("POST /disconnect", resp)
             return 0 if resp.ok else 1
 
-        if args.command == "check-mark":
+        if args.command in ("check-marks", "check-mark"):
             if args.mark_b64:
                 payload: dict[str, Any] = {
                     "type": "sellReturn" if args.sell_return else "sell",
@@ -1111,32 +1515,44 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 if args.cashier:
                     payload["cashierName"] = args.cashier
+                if args.check_permission:
+                    payload["checkPermission"] = True
+                if args.inn:
+                    payload["inn"] = args.inn
+                if args.fn_number:
+                    payload["fnNumber"] = args.fn_number
             elif args.mark:
                 payload = sample_check_mark_payload(
                     marks_raw=[args.mark],
                     sell_return=args.sell_return,
                     async_mode=args.async_mode,
                     cashier_name=args.cashier,
+                    check_permission=args.check_permission,
+                    inn=args.inn,
+                    fn_number=args.fn_number,
                 )
             else:
                 payload = sample_check_mark_payload(
                     sell_return=args.sell_return,
                     async_mode=args.async_mode,
                     cashier_name=args.cashier,
+                    check_permission=args.check_permission,
+                    inn=args.inn,
+                    fn_number=args.fn_number,
                 )
             print("Тело запроса:")
             print(json.dumps(payload, ensure_ascii=False, indent=2))
-            resp = client.check_mark(payload)
-            print_response("POST /check-mark", resp)
+            resp = client.check_marks(payload)
+            print_response("POST /check-marks", resp)
             if resp.ok and args.async_mode and resp.json and resp.json.get("taskId"):
                 print(f"\nОжидание async taskId={resp.json['taskId']} ...")
                 resp = wait_async_check_mark(client, resp.json["taskId"], args.wait)
-                print_response("GET /check-mark/status (completed)", resp)
+                print_response("GET /check-marks/status (completed)", resp)
             return 0 if resp.ok else 1
 
-        if args.command == "check-mark-status":
-            resp = client.check_mark_status(args.task_id)
-            print_response("GET /check-mark/status", resp)
+        if args.command in ("check-marks-status", "check-mark-status"):
+            resp = client.check_marks_status(args.task_id)
+            print_response("GET /check-marks/status", resp)
             return 0 if resp.ok else 1
 
         if args.command == "smoke":
@@ -1158,6 +1574,7 @@ def main(argv: list[str] | None = None) -> int:
                 password=args.password,
                 scenario=args.scenario,
                 mark_raw=args.mark,
+                check_permission=args.check_permission,
             )
 
     except (ConnectionError, OSError, ValueError, TimeoutError) as exc:

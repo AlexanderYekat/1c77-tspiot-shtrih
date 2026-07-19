@@ -14,6 +14,22 @@ type
     CreatedAt: TDateTime;
   end;
 
+  /// <summary>Кэш результата проверки одной марки (ККТ + РР) в рамках текущего чека.</summary>
+  TMarkCacheEntry = record
+    KktAccepted: Boolean;
+    KktResultCode: Integer;
+    KktDescription: string;
+    RrChecked: Boolean;
+    RrAccepted: Boolean;
+    RrCode: Integer;
+    RrDescription: string;
+    Uuid: string;
+    TimeStr: string;
+    Inst: string;
+    Version: string;
+    CheckedAt: TDateTime;
+  end;
+
   TVariantPrint = class
   private
     ovObject: OleVariant;      // COM-объект драйвера ККТ (AddIn.DrvFR) — держим один на всё время
@@ -22,7 +38,7 @@ type
     FLock: TCriticalSection;   // защита от параллельных обращений к ККТ
     FMarkTasksLock: TCriticalSection;
     FMarkTasks: TObjectDictionary<string, TCheckMarkTaskEntry>;
-    FAcceptedMarks: TDictionary<string, Byte>; // принятые марки в рамках текущего чека
+    FMarkCache: TDictionary<string, TMarkCacheEntry>; // кэш ККТ+РР в рамках текущего чека
     FConnected: Boolean;       // текущее состояние соединения, как мы его понимаем
     FEmulation: Boolean;
     FTestReceiptMode: Boolean; // тестовый режим: CancelCheck вместо FNCloseCheckEx
@@ -68,11 +84,26 @@ type
     procedure StartAsyncCheckMark(const Body, TaskId: string);
     function NewTaskId: string;
     procedure CollectMarksFromRequest(Req: TJSONObject; out MarksB64: TArray<string>);
+    procedure CollectMarksFromReceiptItems(Req: TJSONObject; out MarksB64: TArray<string>);
+    function EnsureMarksReadyForPrint(Req: TJSONObject): string;
 
     function MarkCacheKey(const MarkDecoded: string; ReturnCheck: Boolean): string;
+    function TryGetMarkFromCache(const MarkDecoded: string; ReturnCheck: Boolean;
+      out Entry: TMarkCacheEntry): Boolean;
     function IsMarkAcceptedInCache(const MarkDecoded: string; ReturnCheck: Boolean): Boolean;
+    function IsMarkFullyOk(const MarkDecoded: string; ReturnCheck,
+      CheckPermission: Boolean): Boolean;
+    procedure UpsertMarkCacheKkt(const MarkDecoded: string; ReturnCheck: Boolean;
+      KktAccepted: Boolean; KktResultCode: Integer; const KktDescription: string);
+    procedure UpsertMarkCacheRr(const MarkDecoded: string; ReturnCheck: Boolean;
+      RrAccepted: Boolean; RrCode: Integer; const RrDescription, Uuid, TimeStr,
+      Inst, Version: string);
+    procedure UpdateMarkCacheFromMarkObj(const MarkDecoded: string;
+      ReturnCheck: Boolean; MarkObj: TJSONObject);
     procedure AddMarkToAcceptedCache(const MarkDecoded: string; ReturnCheck: Boolean);
-    procedure ClearAcceptedMarksCache;
+    procedure ClearMarkCache;
+    function MarkObjFromCacheEntry(const Entry: TMarkCacheEntry): TJSONObject;
+    function PermissionObjFromCacheEntry(const Entry: TMarkCacheEntry): TJSONObject;
 
     procedure ReadInnAndFn(out Inn, FnNumber: string);
     function ResolvePermissionInn(Req: TJSONObject): string;
@@ -357,7 +388,7 @@ begin
   FLock := TCriticalSection.Create;
   FMarkTasksLock := TCriticalSection.Create;
   FMarkTasks := TObjectDictionary<string, TCheckMarkTaskEntry>.Create([doOwnsValues]);
-  FAcceptedMarks := TDictionary<string, Byte>.Create;
+  FMarkCache := TDictionary<string, TMarkCacheEntry>.Create;
   FLog := TKktLogger.Create(ASettings, ChangeFileExt(ParamStr(0), '.log'));
   ovObject := Unassigned;
   FConnected := False;
@@ -395,7 +426,7 @@ begin
     FMarkTasksLock.Leave;
     FMarkTasksLock.Free;
   end;
-  FAcceptedMarks.Free;
+  FMarkCache.Free;
   FLog.Free;
   inherited;
 end;
@@ -864,35 +895,175 @@ begin
     Result := 'S|' + MarkDecoded;
 end;
 
-function TVariantPrint.IsMarkAcceptedInCache(const MarkDecoded: string;
-  ReturnCheck: Boolean): Boolean;
+function TVariantPrint.TryGetMarkFromCache(const MarkDecoded: string;
+  ReturnCheck: Boolean; out Entry: TMarkCacheEntry): Boolean;
 begin
-  Result := (MarkDecoded <> '') and FAcceptedMarks.ContainsKey(MarkCacheKey(MarkDecoded, ReturnCheck));
+  Result := False;
+  Entry := Default(TMarkCacheEntry);
+  if MarkDecoded = '' then
+    Exit;
+  Result := FMarkCache.TryGetValue(MarkCacheKey(MarkDecoded, ReturnCheck), Entry);
 end;
 
-procedure TVariantPrint.AddMarkToAcceptedCache(const MarkDecoded: string;
-  ReturnCheck: Boolean);
+function TVariantPrint.IsMarkAcceptedInCache(const MarkDecoded: string;
+  ReturnCheck: Boolean): Boolean;
+var
+  Entry: TMarkCacheEntry;
+begin
+  Result := TryGetMarkFromCache(MarkDecoded, ReturnCheck, Entry) and Entry.KktAccepted;
+end;
+
+function TVariantPrint.IsMarkFullyOk(const MarkDecoded: string; ReturnCheck,
+  CheckPermission: Boolean): Boolean;
+var
+  Entry: TMarkCacheEntry;
+begin
+  Result := False;
+  if not TryGetMarkFromCache(MarkDecoded, ReturnCheck, Entry) then
+    Exit;
+  if not Entry.KktAccepted then
+    Exit;
+  if CheckPermission and not ReturnCheck then
+  begin
+    if not Entry.RrChecked then
+      Exit;
+    if not Entry.RrAccepted then
+      Exit;
+    if (Trim(Entry.Uuid) = '') or (Trim(Entry.TimeStr) = '') then
+      Exit;
+  end;
+  Result := True;
+end;
+
+procedure TVariantPrint.UpsertMarkCacheKkt(const MarkDecoded: string;
+  ReturnCheck: Boolean; KktAccepted: Boolean; KktResultCode: Integer;
+  const KktDescription: string);
 var
   Key: string;
+  Entry: TMarkCacheEntry;
 begin
   if MarkDecoded = '' then
     Exit;
   Key := MarkCacheKey(MarkDecoded, ReturnCheck);
-  if not FAcceptedMarks.ContainsKey(Key) then
+  if not FMarkCache.TryGetValue(Key, Entry) then
   begin
-    FAcceptedMarks.Add(Key, 1);
-    FLog.LogInfo('Кэш марки: добавлена, len=' + IntToStr(Length(MarkDecoded)) +
-      ', return=' + BoolToStr(ReturnCheck, True));
+    Entry := Default(TMarkCacheEntry);
+    Entry.RrAccepted := True; // РР ещё не проверялся
+  end;
+  Entry.KktAccepted := KktAccepted;
+  Entry.KktResultCode := KktResultCode;
+  Entry.KktDescription := KktDescription;
+  Entry.CheckedAt := Now;
+  FMarkCache.AddOrSetValue(Key, Entry);
+  FLog.LogInfo(Format('Кэш марки ККТ: accepted=%s code=%d len=%d return=%s',
+    [BoolToStr(KktAccepted, True), KktResultCode, Length(MarkDecoded),
+     BoolToStr(ReturnCheck, True)]));
+end;
+
+procedure TVariantPrint.UpsertMarkCacheRr(const MarkDecoded: string;
+  ReturnCheck: Boolean; RrAccepted: Boolean; RrCode: Integer;
+  const RrDescription, Uuid, TimeStr, Inst, Version: string);
+var
+  Key: string;
+  Entry: TMarkCacheEntry;
+begin
+  if MarkDecoded = '' then
+    Exit;
+  Key := MarkCacheKey(MarkDecoded, ReturnCheck);
+  if not FMarkCache.TryGetValue(Key, Entry) then
+    Entry := Default(TMarkCacheEntry);
+  Entry.RrChecked := True;
+  Entry.RrAccepted := RrAccepted;
+  Entry.RrCode := RrCode;
+  Entry.RrDescription := RrDescription;
+  Entry.Uuid := Uuid;
+  Entry.TimeStr := TimeStr;
+  Entry.Inst := Inst;
+  Entry.Version := Version;
+  Entry.CheckedAt := Now;
+  FMarkCache.AddOrSetValue(Key, Entry);
+  FLog.LogInfo(Format('Кэш марки РР: accepted=%s code=%d uuid=%s len=%d',
+    [BoolToStr(RrAccepted, True), RrCode, Uuid, Length(MarkDecoded)]));
+end;
+
+procedure TVariantPrint.UpdateMarkCacheFromMarkObj(const MarkDecoded: string;
+  ReturnCheck: Boolean; MarkObj: TJSONObject);
+var
+  PermObj: TJSONObject;
+  CodeStr, Desc: string;
+begin
+  if (MarkDecoded = '') or (MarkObj = nil) then
+    Exit;
+
+  Desc := JStr(MarkObj, 'description', '');
+  if (Length(Desc) >= 9) and (Copy(Desc, Length(Desc) - 8, 9) = ' (cached)') then
+    Desc := Copy(Desc, 1, Length(Desc) - 9);
+
+  UpsertMarkCacheKkt(MarkDecoded, ReturnCheck,
+    JBool(MarkObj, 'accepted', False),
+    JInt(MarkObj, 'resultCode', 0),
+    Desc);
+
+  PermObj := MarkObj.GetValue('permission') as TJSONObject;
+  if PermObj = nil then
+    Exit;
+
+  CodeStr := JStr(PermObj, 'code', '0');
+  UpsertMarkCacheRr(MarkDecoded, ReturnCheck,
+    JBool(PermObj, 'accepted', False),
+    StrToIntDef(CodeStr, 0),
+    JStr(PermObj, 'error', ''),
+    JStr(PermObj, 'uuid', ''),
+    JStr(PermObj, 'time', ''),
+    JStr(PermObj, 'inst', ''),
+    JStr(PermObj, 'version', ''));
+end;
+
+procedure TVariantPrint.AddMarkToAcceptedCache(const MarkDecoded: string;
+  ReturnCheck: Boolean);
+begin
+  UpsertMarkCacheKkt(MarkDecoded, ReturnCheck, True, 0, 'OK');
+end;
+
+procedure TVariantPrint.ClearMarkCache;
+begin
+  if FMarkCache.Count > 0 then
+  begin
+    FLog.LogInfo('Сброс кэша марок (' + IntToStr(FMarkCache.Count) + ')');
+    FMarkCache.Clear;
   end;
 end;
 
-procedure TVariantPrint.ClearAcceptedMarksCache;
+function TVariantPrint.MarkObjFromCacheEntry(const Entry: TMarkCacheEntry): TJSONObject;
+var
+  Desc: string;
 begin
-  if FAcceptedMarks.Count > 0 then
-  begin
-    FLog.LogInfo('Сброс кэша принятых марок (' + IntToStr(FAcceptedMarks.Count) + ')');
-    FAcceptedMarks.Clear;
-  end;
+  Result := TJSONObject.Create;
+  Result.AddPair('accepted', TJSONBool.Create(Entry.KktAccepted));
+  Result.AddPair('resultCode', TJSONNumber.Create(Entry.KktResultCode));
+  Result.AddPair('checkItemLocalResult', TJSONNumber.Create(15));
+  Result.AddPair('checkItemLocalError', TJSONNumber.Create(0));
+  Result.AddPair('markingType2', TJSONNumber.Create(0));
+  Result.AddPair('kmServerErrorCode', TJSONNumber.Create(0));
+  Result.AddPair('kmServerCheckingStatus', TJSONNumber.Create(15));
+  Desc := Entry.KktDescription;
+  if Desc = '' then
+    Desc := 'OK';
+  if Pos('(cached)', Desc) = 0 then
+    Desc := Desc + ' (cached)';
+  Result.AddPair('description', Desc);
+end;
+
+function TVariantPrint.PermissionObjFromCacheEntry(const Entry: TMarkCacheEntry): TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  Result.AddPair('accepted', TJSONBool.Create(Entry.RrAccepted));
+  Result.AddPair('code', IntToStr(Entry.RrCode));
+  Result.AddPair('error', Entry.RrDescription);
+  Result.AddPair('uuid', Entry.Uuid);
+  Result.AddPair('time', Entry.TimeStr);
+  Result.AddPair('inst', Entry.Inst);
+  Result.AddPair('version', Entry.Version);
 end;
 
 procedure TVariantPrint.ProcessMarkingAfterFNOperation(const MarkDecoded: string;
@@ -909,9 +1080,11 @@ begin
   if EffectiveAccepted then
   begin
     if FromCache and not MarkAccepted then
-      FLog.LogInfo('markAccepted не указан, но марка уже принята в текущем чеке — только FNSendItemBarcode')
+      FLog.LogInfo('markAccepted из pre-flight/кэша — только FNSendItemBarcode')
+    else if MarkAccepted then
+      FLog.LogInfo('markAccepted=true — только FNSendItemBarcode')
     else
-      FLog.LogInfo('markAccepted=true — только FNSendItemBarcode');
+      FLog.LogInfo('марка принята — только FNSendItemBarcode');
     SendMarkingCodeAfterFNOperation(MarkDecoded);
     AddMarkToAcceptedCache(MarkDecoded, ReturnCheck);
     Exit;
@@ -1017,6 +1190,7 @@ var
   Qty, Price: Double;
   Department, Tax1, PayObj, PayMethod: Integer;
   MarkAccepted, HasMark: Boolean;
+  Cached: TMarkCacheEntry;
 begin
   ItemType := LowerCase(Trim(JStr(Item, 'type', 'position')));
   if (ItemType <> 'position') and (ItemType <> '') and (JStr(Item, 'name') = '') then
@@ -1052,6 +1226,20 @@ begin
     Tag1262 := JStr(PermObj, 'tag1262', Tag1262);
     Tag1263 := JStr(PermObj, 'tag1263', Tag1263);
     Tag1264 := JStr(PermObj, 'tag1264', Tag1264);
+  end;
+
+  // Ленивый клиент: permission не в JSON — берём из FMarkCache (после pre-flight / check-marks)
+  if HasMark and (not ReturnCheck) and ((UUID = '') or (TimeStr = '')) then
+  begin
+    if TryGetMarkFromCache(MarkDecoded, ReturnCheck, Cached) and Cached.RrChecked and
+      (Cached.Uuid <> '') and (Cached.TimeStr <> '') then
+    begin
+      UUID := Cached.Uuid;
+      TimeStr := Cached.TimeStr;
+      Inst := Cached.Inst;
+      Version := Cached.Version;
+      FLog.LogInfo('permission из кэша: uuid=' + UUID);
+    end;
   end;
 
   TaxObj := Item.GetValue('tax') as TJSONObject;
@@ -1198,7 +1386,7 @@ begin
       ovObject.FNCloseCheckEx;
     end);
   end;
-  ClearAcceptedMarksCache;
+  ClearMarkCache;
 end;
 
 function TVariantPrint.PrintCheckJson(const Body: string): string;
@@ -1207,7 +1395,7 @@ var
   Items: TJSONArray;
   I, CheckNumber: Integer;
   ReturnCheck: Boolean;
-  SerialNumber, ItemType, CashierName: string;
+  SerialNumber, ItemType, CashierName, PreflightErr: string;
   DefaultDept: Integer;
 begin
   FLock.Enter;
@@ -1228,45 +1416,55 @@ begin
       if Items = nil then
         raise Exception.Create('items is empty');
 
-      DefaultDept := JInt(Req, 'department', 1);
-      ApplyReceiptHeader(Req, ReturnCheck);
-
-      for I := 0 to Items.Count - 1 do
+      PreflightErr := EnsureMarksReadyForPrint(Req);
+      if PreflightErr <> '' then
       begin
-        if not (Items.Items[I] is TJSONObject) then
-          Continue;
-        Item := TJSONObject(Items.Items[I]);
-        ItemType := LowerCase(Trim(JStr(Item, 'type', 'position')));
-        if ItemType = 'text' then
-          PrintReceiptText(JStr(Item, 'text'))
-        else if (ItemType = 'position') or (ItemType = '') or (JStr(Item, 'name') <> '') then
-          RegisterReceiptItem(Item, ReturnCheck, DefaultDept)
-        else
-          FLog.LogInfo('Пропуск элемента items type="' + ItemType + '"');
-      end;
-
-      CloseReceiptFromJson(Req);
-
-      CheckNumber := ReadCheckNumberAfterClose;
-      SerialNumber := ReadSerialNumber;
-
-      if not FTestReceiptMode then
-        RunFR('CutCheck', procedure
-        begin
-          ovObject.CutType := 1;
-          ovObject.CutCheck;
-        end)
+        Result := PreflightErr;
+        FLog.LogError('PrintCheckJson: pre-flight — марки не прошли, чек не открываем');
+        // кэш не сбрасываем — результаты проверки уже известны
+      end
       else
-        FLog.LogInfo('Тестовый режим: CutCheck пропущен');
+      begin
+        DefaultDept := JInt(Req, 'department', 1);
+        ApplyReceiptHeader(Req, ReturnCheck);
 
-      Result := JsonOk(
-        '"checkNumber":' + IntToStr(CheckNumber) + ',' +
-        '"serialNumber":"' + JsonEscape(SerialNumber) + '"');
+        for I := 0 to Items.Count - 1 do
+        begin
+          if not (Items.Items[I] is TJSONObject) then
+            Continue;
+          Item := TJSONObject(Items.Items[I]);
+          ItemType := LowerCase(Trim(JStr(Item, 'type', 'position')));
+          if ItemType = 'text' then
+            PrintReceiptText(JStr(Item, 'text'))
+          else if (ItemType = 'position') or (ItemType = '') or (JStr(Item, 'name') <> '') then
+            RegisterReceiptItem(Item, ReturnCheck, DefaultDept)
+          else
+            FLog.LogInfo('Пропуск элемента items type="' + ItemType + '"');
+        end;
 
-      FLog.LogInfo(Format('PrintCheckJson OK checkNumber=%d serial=%s',
-        [CheckNumber, SerialNumber]));
-      ClearAcceptedMarksCache;
-      AfterCommand(Req);
+        CloseReceiptFromJson(Req);
+
+        CheckNumber := ReadCheckNumberAfterClose;
+        SerialNumber := ReadSerialNumber;
+
+        if not FTestReceiptMode then
+          RunFR('CutCheck', procedure
+          begin
+            ovObject.CutType := 1;
+            ovObject.CutCheck;
+          end)
+        else
+          FLog.LogInfo('Тестовый режим: CutCheck пропущен');
+
+        Result := JsonOk(
+          '"checkNumber":' + IntToStr(CheckNumber) + ',' +
+          '"serialNumber":"' + JsonEscape(SerialNumber) + '"');
+
+        FLog.LogInfo(Format('PrintCheckJson OK checkNumber=%d serial=%s',
+          [CheckNumber, SerialNumber]));
+        ClearMarkCache;
+        AfterCommand(Req);
+      end;
     except
       on E: Exception do
       begin
@@ -1277,7 +1475,7 @@ begin
           begin
             ovObject.CancelCheck;
           end);
-          ClearAcceptedMarksCache;
+          ClearMarkCache;
           Inc(FEmulatedCheckNumber);
           Result := JsonOk(
             '"checkNumber":' + IntToStr(FEmulatedCheckNumber) + ',' +
@@ -1287,7 +1485,7 @@ begin
         else
         begin
           try ovObject.CancelCheck; except end;
-          ClearAcceptedMarksCache;
+          ClearMarkCache;
           Result := JsonError(E.Message);
         end;
       end;
@@ -1328,7 +1526,7 @@ begin
 
       Result := JsonOk('"documentNumber":' + IntToStr(SessionNumber));
       FLog.LogInfo('CloseShiftJson OK documentNumber=' + IntToStr(SessionNumber));
-      ClearAcceptedMarksCache;
+      ClearMarkCache;
       AfterCommand(Req);
     except
       on E: Exception do
@@ -1338,7 +1536,7 @@ begin
         begin
           Inc(FEmulatedSessionNumber);
           Result := JsonOk('"documentNumber":' + IntToStr(FEmulatedSessionNumber));
-          ClearAcceptedMarksCache;
+          ClearMarkCache;
           AfterCommand(Req);
         end
         else
@@ -1413,7 +1611,7 @@ begin
       begin
         ovObject.CancelCheck;
       end);
-      ClearAcceptedMarksCache;
+      ClearMarkCache;
       Result := JsonOk;
       FLog.LogInfo('CancelCheckJson OK');
       AfterCommand(Req);
@@ -1424,7 +1622,7 @@ begin
         if FEmulation then
         begin
           Result := JsonOk;
-          ClearAcceptedMarksCache;
+          ClearMarkCache;
           AfterCommand(Req);
         end
         else
@@ -1457,7 +1655,7 @@ begin
       begin
         ovObject.FNMarkingClearBuffer;
       end);
-      ClearAcceptedMarksCache;
+      ClearMarkCache;
       Result := JsonOk;
       FLog.LogInfo('ClearBufferOfMarksJson OK');
       AfterCommand(Req);
@@ -1468,7 +1666,7 @@ begin
         if FEmulation then
         begin
           Result := JsonOk;
-          ClearAcceptedMarksCache;
+          ClearMarkCache;
           AfterCommand(Req);
         end
         else
@@ -1576,6 +1774,185 @@ begin
   MarksB64[0] := SingleMark;
 end;
 
+procedure TVariantPrint.CollectMarksFromReceiptItems(Req: TJSONObject;
+  out MarksB64: TArray<string>);
+var
+  Items: TJSONArray;
+  Item: TJSONObject;
+  I: Integer;
+  ItemType, MarkB64: string;
+begin
+  SetLength(MarksB64, 0);
+  if Req = nil then
+    Exit;
+  Items := Req.GetValue('items') as TJSONArray;
+  if Items = nil then
+    Exit;
+
+  for I := 0 to Items.Count - 1 do
+  begin
+    if not (Items.Items[I] is TJSONObject) then
+      Continue;
+    Item := TJSONObject(Items.Items[I]);
+    ItemType := LowerCase(Trim(JStr(Item, 'type', 'position')));
+    if (ItemType <> 'position') and (ItemType <> '') then
+      Continue;
+    MarkB64 := Trim(JStr(Item, 'mark'));
+    if MarkB64 = '' then
+      Continue;
+    SetLength(MarksB64, Length(MarksB64) + 1);
+    MarksB64[High(MarksB64)] := MarkB64;
+  end;
+end;
+
+function TVariantPrint.EnsureMarksReadyForPrint(Req: TJSONObject): string;
+var
+  MarksB64: TArray<string>;
+  MarksOut: TJSONArray;
+  Root, MarkObj, PermObj: TJSONObject;
+  ReturnCheck, CheckPermission: Boolean;
+  PermissionInn, PermissionFn: string;
+  I: Integer;
+  MarkDecoded: string;
+  AllAccepted, AllPermissionAccepted, Accepted, PermAccepted: Boolean;
+  Cached: TMarkCacheEntry;
+  HasErrors: Boolean;
+begin
+  Result := '';
+  if Req = nil then
+    Exit;
+
+  if JBool(Req, 'skipMarkPreflight', False) then
+  begin
+    FLog.LogInfo('print-check: skipMarkPreflight=true — pre-flight пропущен');
+    Exit;
+  end;
+
+  CollectMarksFromReceiptItems(Req, MarksB64);
+  if Length(MarksB64) = 0 then
+  begin
+    FLog.LogInfo('print-check: pre-flight — маркированных позиций нет');
+    Exit;
+  end;
+
+  ReturnCheck := GetReceiptReturnCheck(Req);
+  // РР только для sell; по умолчанию включаем (ленивый клиент без permission в JSON)
+  CheckPermission := (not ReturnCheck) and JBool(Req, 'checkPermission', True);
+
+  FLog.LogInfo(Format(
+    'print-check: pre-flight begin, marks=%d return=%s checkPermission=%s',
+    [Length(MarksB64), BoolToStr(ReturnCheck, True), BoolToStr(CheckPermission, True)]));
+
+  if CheckPermission then
+  begin
+    PermissionInn := ResolvePermissionInn(Req);
+    PermissionFn := ResolvePermissionFn(Req);
+  end;
+
+  MarksOut := TJSONArray.Create;
+  try
+    AllAccepted := True;
+    AllPermissionAccepted := True;
+    HasErrors := False;
+
+    for I := 0 to High(MarksB64) do
+    begin
+      MarkDecoded := DecodeMarkBase64(MarksB64[I]);
+      FLog.LogInfo(Format('pre-flight марка [%d/%d], len=%d',
+        [I + 1, Length(MarksB64), Length(MarkDecoded)]));
+
+      if IsMarkFullyOk(MarkDecoded, ReturnCheck, CheckPermission) then
+      begin
+        TryGetMarkFromCache(MarkDecoded, ReturnCheck, Cached);
+        FLog.LogInfo(Format('pre-flight [%d]: из кэша — skip', [I + 1]));
+        MarkObj := MarkObjFromCacheEntry(Cached);
+        try
+          MarkObj.AddPair('index', TJSONNumber.Create(I));
+          MarkObj.AddPair('mark', MarksB64[I]);
+          if CheckPermission and Cached.RrChecked then
+            MarkObj.AddPair('permission', PermissionObjFromCacheEntry(Cached));
+          MarksOut.AddElement(MarkObj);
+          MarkObj := nil;
+        finally
+          MarkObj.Free;
+        end;
+        Continue;
+      end;
+
+      MarkObj := CheckSingleMark(MarkDecoded, ReturnCheck);
+      try
+        MarkObj.AddPair('index', TJSONNumber.Create(I));
+        MarkObj.AddPair('mark', MarksB64[I]);
+
+        Accepted := JBool(MarkObj, 'accepted', False);
+        if not Accepted then
+        begin
+          AllAccepted := False;
+          HasErrors := True;
+        end;
+
+        if CheckPermission then
+        begin
+          if TryGetMarkFromCache(MarkDecoded, ReturnCheck, Cached) and Cached.RrChecked then
+          begin
+            FLog.LogInfo(Format('pre-flight РР [%d]: из кэша — skip POST /document', [I + 1]));
+            PermObj := PermissionObjFromCacheEntry(Cached);
+          end
+          else
+          begin
+            FLog.LogInfo(Format('pre-flight РР [%d]: проверка', [I + 1]));
+            PermObj := CheckSingleMarkPermission(MarksB64[I], PermissionInn, PermissionFn);
+          end;
+          try
+            MarkObj.AddPair('permission', PermObj);
+            PermObj := nil;
+            PermAccepted := False;
+            if MarkObj.GetValue('permission') is TJSONObject then
+              PermAccepted := JBool(TJSONObject(MarkObj.GetValue('permission')), 'accepted', False);
+            if not PermAccepted then
+            begin
+              AllPermissionAccepted := False;
+              HasErrors := True;
+            end;
+          finally
+            PermObj.Free;
+          end;
+        end;
+
+        UpdateMarkCacheFromMarkObj(MarkDecoded, ReturnCheck, MarkObj);
+        MarksOut.AddElement(MarkObj);
+        MarkObj := nil;
+      finally
+        MarkObj.Free;
+      end;
+    end;
+
+    if not HasErrors then
+    begin
+      FLog.LogInfo('print-check: pre-flight OK — все марки готовы');
+      Exit;
+    end;
+
+    Root := TJSONObject.Create;
+    try
+      Root.AddPair('result', TJSONNumber.Create(0));
+      Root.AddPair('description', 'Не все марки прошли проверку');
+      Root.AddPair('allAccepted', TJSONBool.Create(AllAccepted));
+      if CheckPermission then
+        Root.AddPair('allPermissionAccepted', TJSONBool.Create(AllPermissionAccepted));
+      Root.AddPair('marks', MarksOut);
+      MarksOut := nil;
+      Result := JsonToPlainText(Root);
+    finally
+      Root.Free;
+    end;
+    FLog.LogError('print-check: pre-flight FAIL allAccepted=' +
+      BoolToStr(AllAccepted, True));
+  finally
+    MarksOut.Free;
+  end;
+end;
+
 procedure TVariantPrint.EnsureSessionOpen(const CashierName: string);
 var
   SessionNotOpen: Boolean;
@@ -1640,23 +2017,17 @@ var
   ResCheck: Integer;
   Accepted: Boolean;
   Desc: string;
+  Cached: TMarkCacheEntry;
 begin
-  Result := TJSONObject.Create;
-
-  if IsMarkAcceptedInCache(MarkDecoded, ReturnCheck) then
+  if TryGetMarkFromCache(MarkDecoded, ReturnCheck, Cached) and Cached.KktAccepted then
   begin
-    FLog.LogInfo('check-marks: марка из кэша чека — skip FNCheckItemBarcode, len=' +
-      IntToStr(Length(MarkDecoded)));
-    Result.AddPair('accepted', TJSONBool.Create(True));
-    Result.AddPair('resultCode', TJSONNumber.Create(0));
-    Result.AddPair('checkItemLocalResult', TJSONNumber.Create(15));
-    Result.AddPair('checkItemLocalError', TJSONNumber.Create(0));
-    Result.AddPair('markingType2', TJSONNumber.Create(0));
-    Result.AddPair('kmServerErrorCode', TJSONNumber.Create(0));
-    Result.AddPair('kmServerCheckingStatus', TJSONNumber.Create(15));
-    Result.AddPair('description', 'OK (cached)');
+    FLog.LogInfo('check-marks: марка из кэша — skip FNCheckItemBarcode, len=' +
+      IntToStr(Length(MarkDecoded)) + ', desc=' + Cached.KktDescription);
+    Result := MarkObjFromCacheEntry(Cached);
     Exit;
   end;
+
+  Result := TJSONObject.Create;
 
   FLog.LogInfo('FNCheckItemBarcode begin, len=' + IntToStr(Length(MarkDecoded)));
   RunFR('FNCheckItemBarcode', procedure
@@ -1681,7 +2052,7 @@ begin
     Result.AddPair('kmServerErrorCode', TJSONNumber.Create(0));
     Result.AddPair('kmServerCheckingStatus', TJSONNumber.Create(15));
     Result.AddPair('description', 'OK (emulation)');
-    AddMarkToAcceptedCache(MarkDecoded, ReturnCheck);
+    UpsertMarkCacheKkt(MarkDecoded, ReturnCheck, True, 0, 'OK (emulation)');
     Exit;
   end;
 
@@ -1760,10 +2131,8 @@ begin
     end);
   end;
 
-  if Accepted then
-    AddMarkToAcceptedCache(MarkDecoded, ReturnCheck);
-
   Result.AddPair('accepted', TJSONBool.Create(Accepted));
+  UpsertMarkCacheKkt(MarkDecoded, ReturnCheck, Accepted, ResCheck, Desc);
 end;
 
 procedure TVariantPrint.ReadInnAndFn(out Inn, FnNumber: string);
@@ -2085,6 +2454,7 @@ var
   I: Integer;
   MarkDecoded: string;
   AllAccepted, AllPermissionAccepted, PermAccepted, Accepted: Boolean;
+  Cached: TMarkCacheEntry;
 begin
   V := TJSONObject.ParseJSONValue(Body);
   if not (V is TJSONObject) then
@@ -2125,12 +2495,43 @@ begin
         FLog.LogInfo(Format('Проверка марки [%d/%d], длина=%d',
           [I + 1, Length(MarksB64), Length(MarkDecoded)]));
 
+        if IsMarkFullyOk(MarkDecoded, ReturnCheck, CheckPermission) then
+        begin
+          TryGetMarkFromCache(MarkDecoded, ReturnCheck, Cached);
+          FLog.LogInfo(Format('Марка [%d/%d] полностью из кэша (ККТ+РР) — skip',
+            [I + 1, Length(MarksB64)]));
+          MarkObj := MarkObjFromCacheEntry(Cached);
+          try
+            if CheckPermission and not ReturnCheck and Cached.RrChecked then
+              MarkObj.AddPair('permission', PermissionObjFromCacheEntry(Cached));
+            MarkObj.AddPair('index', TJSONNumber.Create(I));
+            if not Cached.KktAccepted then
+              AllAccepted := False;
+            if CheckPermission and not ReturnCheck and not Cached.RrAccepted then
+              AllPermissionAccepted := False;
+            MarksOut.AddElement(MarkObj);
+            MarkObj := nil;
+          finally
+            MarkObj.Free;
+          end;
+          Continue;
+        end;
+
         MarkObj := CheckSingleMark(MarkDecoded, ReturnCheck);
         try
           if CheckPermission and not ReturnCheck then
           begin
-            FLog.LogInfo(Format('Проверка РР [%d/%d]', [I + 1, Length(MarksB64)]));
-            PermObj := CheckSingleMarkPermission(MarksB64[I], PermissionInn, PermissionFn);
+            if TryGetMarkFromCache(MarkDecoded, ReturnCheck, Cached) and Cached.RrChecked then
+            begin
+              FLog.LogInfo(Format('РР [%d/%d] из кэша — skip POST /document',
+                [I + 1, Length(MarksB64)]));
+              PermObj := PermissionObjFromCacheEntry(Cached);
+            end
+            else
+            begin
+              FLog.LogInfo(Format('Проверка РР [%d/%d]', [I + 1, Length(MarksB64)]));
+              PermObj := CheckSingleMarkPermission(MarksB64[I], PermissionInn, PermissionFn);
+            end;
             try
               MarkObj.AddPair('permission', PermObj);
               PermObj := nil;
@@ -2146,6 +2547,8 @@ begin
               PermObj.Free;
             end;
           end;
+
+          UpdateMarkCacheFromMarkObj(MarkDecoded, ReturnCheck, MarkObj);
 
           MarkObj.AddPair('index', TJSONNumber.Create(I));
           Accepted := False;
@@ -2214,15 +2617,19 @@ begin
     FMarkTasksLock.Leave;
   end;
 
+  FLog.LogInfo('async check-marks: задача принята taskId=' + TaskId);
+
   TThread.CreateAnonymousThread(
     procedure
     var
       JsonResult: string;
       TaskEntry: TCheckMarkTaskEntry;
+      Ok: Boolean;
     begin
       FLock.Enter;
       try
         try
+          // CheckMarkInternal уже пишет полный marks[] (в т.ч. permission) в FMarkCache
           JsonResult := CheckMarkInternal(Body);
         except
           on E: Exception do
@@ -2232,11 +2639,13 @@ begin
         FLock.Leave;
       end;
 
+      Ok := (Pos('"result":1', JsonResult) > 0) or (Pos('"result": 1', JsonResult) > 0);
+
       FMarkTasksLock.Enter;
       try
         if FMarkTasks.TryGetValue(TaskId, TaskEntry) then
         begin
-          if Pos('"result":1', JsonResult) > 0 then
+          if Ok then
             TaskEntry.Status := 'completed'
           else
             TaskEntry.Status := 'error';
@@ -2245,6 +2654,13 @@ begin
       finally
         FMarkTasksLock.Leave;
       end;
+
+      if Ok then
+        FLog.LogInfo('async check-marks: completed taskId=' + TaskId +
+          ' — FMarkCache обновлён (через CheckMarkInternal)')
+      else
+        FLog.LogError('async check-marks: error taskId=' + TaskId + ' ' +
+          JsonBodyPreviewPlain(JsonResult, 200));
     end).Start;
 end;
 

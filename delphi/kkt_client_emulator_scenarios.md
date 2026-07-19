@@ -228,6 +228,53 @@ N async `POST /check-marks` **почти одновременно** (разны�
 
 ---
 
+## Тест кэша марок: `mark-cache-test`
+
+Проверка `FMarkCache` в Delphi (этап 1 ТЗ): повторный `check-marks` не ходит на ККТ/РР.
+
+| Параметр | По умолчанию | Описание |
+|----------|--------------|----------|
+| `--scenario` | `all` | `duplicate-check`, `kkt-rr-cache`, `cancel-reset`, `check-then-print`, `duplicate-items`, `lazy-full-flow`, `all` |
+| `--mark` | тестовая КМ | Марка (кодируется в base64) |
+| `--check-permission` | off | Во всех сценариях передавать `checkPermission=true` |
+
+```bash
+# Главный сценарий этапа 1 (ККТ + РР → повтор из кэша)
+python kkt_client_emulator.py mark-cache-test --scenario kkt-rr-cache
+
+# Только дедуп ККТ без РР
+python kkt_client_emulator.py mark-cache-test --scenario duplicate-check
+
+# Все сценарии; РР включить везде:
+python kkt_client_emulator.py mark-cache-test --check-permission
+
+# Ручная проверка:
+python kkt_client_emulator.py check-marks --check-permission
+python kkt_client_emulator.py check-marks --check-permission
+```
+
+### Подсценарии
+
+| Сценарий | Что проверяет |
+|----------|---------------|
+| `kkt-rr-cache` | Два `check-marks` с РР: второй `(cached)`, тот же uuid |
+| `preflight-print` | `print-check` без check-marks — pre-flight; затем из кэша |
+| `async-then-print` | async check-marks → status → print из кэша (этап 3) |
+| `duplicate-check` | Два `check-marks`: второй из кэша |
+| `cancel-reset` | После `cancel-check` кэш сброшен |
+| `check-then-print` / `lazy-full-flow` | Печать без `markAccepted` после check |
+| `duplicate-items` | Две позиции с одной маркой в одном чеке |
+
+```bash
+# Этап 2 — pre-flight
+python kkt_client_emulator.py mark-cache-test --scenario preflight-print
+python kkt_client_emulator.py print-check --mark-only --check-permission
+```
+
+В логе Delphi ожидайте: `полностью из кэша (ККТ+РР) — skip`, `pre-flight begin`, `permission из кэша`.
+
+---
+
 ## Формат вывода `queue-test`
 
 Для каждого шага:
