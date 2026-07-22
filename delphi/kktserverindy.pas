@@ -46,6 +46,7 @@ implementation
 procedure TkktServerIndyForm.FormCreate(Sender: TObject);
 begin
   VersionLabel.Caption := 'Версия: ' + TFmuHttpServer.ReadExeFileVersion;
+  ButtonStartServerClick(nil);
 end;
 
 procedure TkktServerIndyForm.AppendLogLine(const Line: string);
