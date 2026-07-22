@@ -5,7 +5,8 @@ interface
 uses
   System.SysUtils, System.Variants, System.JSON, System.IniFiles,
   System.SyncObjs, System.NetEncoding, System.Generics.Collections,
-  System.Classes, System.DateUtils, ComObj, uKktLog;
+  System.Classes, System.DateUtils, Winapi.Windows, Winapi.ActiveX,
+  ComObj, uKktLog;
 
 type
   TCheckMarkTaskEntry = class
@@ -50,6 +51,19 @@ type
     FEmulatedCheckNumber: Integer;
     FEmulatedSessionNumber: Integer;
 
+    // STA-поток для AddIn.DrvFR: Indy и async-задачи вызывают COM не из main thread
+    FFrThread: TThread;
+    FFrThreadId: TThreadID;
+    FFrWorkAvail: TEvent;
+    FFrWorkDone: TEvent;
+    FFrReady: TEvent;
+    FFrRequest: TProc;
+    FFrError: string;
+    FFrStop: Boolean;
+
+    procedure StartFrComThread;
+    procedure StopFrComThread;
+    procedure ExecOnFrThread(const Proc: TProc);
     function EnsureFRConnected: Boolean;
     procedure DoDisconnect;
     function CheckLinkAlive: Boolean;
@@ -392,6 +406,13 @@ begin
   FLog := TKktLogger.Create(ASettings, ChangeFileExt(ParamStr(0), '.log'));
   ovObject := Unassigned;
   FConnected := False;
+  FFrStop := False;
+  FFrThreadId := 0;
+  FFrRequest := nil;
+  FFrError := '';
+  FFrWorkAvail := TEvent.Create(nil, False, False, '');
+  FFrWorkDone := TEvent.Create(nil, False, False, '');
+  FFrReady := TEvent.Create(nil, True, False, '');
 
   FEmulation := FSettings.ReadBool('KKT', 'Emulation', False);
   FTestReceiptMode := FSettings.ReadBool('KKT', 'TestReceiptMode', False);
@@ -401,6 +422,8 @@ begin
   FEmulatedFnNumber := FSettings.ReadString('KKT', 'EmulatedFnNumber', '9999078900000001');
   FEmulatedCheckNumber := FSettings.ReadInteger('KKT', 'EmulatedCheckNumber', 0);
   FEmulatedSessionNumber := FSettings.ReadInteger('KKT', 'EmulatedSessionNumber', 0);
+
+  StartFrComThread;
 
   if FEmulation then
     FLog.LogInfo('Режим эмуляции ККТ включён — команды ovObject выполняются, ошибки логируются, ответ API = OK')
@@ -417,8 +440,11 @@ begin
     DoDisconnect;
   finally
     FLock.Leave;
-    FLock.Free;
   end;
+  StopFrComThread;
+  FFrWorkAvail.Free;
+  FFrWorkDone.Free;
+  FFrReady.Free;
   FMarkTasksLock.Enter;
   try
     FMarkTasks.Free;
@@ -428,7 +454,78 @@ begin
   end;
   FMarkCache.Free;
   FLog.Free;
+  FLock.Free;
   inherited;
+end;
+
+procedure TVariantPrint.StartFrComThread;
+begin
+  FFrThread := TThread.CreateAnonymousThread(
+    procedure
+    begin
+      CoInitializeEx(nil, COINIT_APARTMENTTHREADED);
+      try
+        FFrThreadId := GetCurrentThreadId;
+        FFrReady.SetEvent;
+        while True do
+        begin
+          FFrWorkAvail.WaitFor(INFINITE);
+          if FFrStop then
+            Break;
+          FFrError := '';
+          try
+            if Assigned(FFrRequest) then
+              FFrRequest();
+          except
+            on E: Exception do
+              FFrError := E.Message;
+          end;
+          FFrRequest := nil;
+          FFrWorkDone.SetEvent;
+        end;
+        try
+          if not (VarIsEmpty(ovObject) or VarIsNull(ovObject)) then
+            ovObject := Unassigned;
+        except
+        end;
+      finally
+        CoUninitialize;
+      end;
+    end);
+  FFrThread.FreeOnTerminate := False;
+  FFrThread.Start;
+  if FFrReady.WaitFor(15000) <> wrSignaled then
+    raise Exception.Create('Не удалось запустить STA-поток драйвера ККТ');
+end;
+
+procedure TVariantPrint.StopFrComThread;
+begin
+  if FFrThread = nil then
+    Exit;
+  FFrStop := True;
+  FFrWorkAvail.SetEvent;
+  FFrThread.WaitFor;
+  FreeAndNil(FFrThread);
+  FFrThreadId := 0;
+end;
+
+procedure TVariantPrint.ExecOnFrThread(const Proc: TProc);
+begin
+  if not Assigned(Proc) then
+    Exit;
+  if GetCurrentThreadId = FFrThreadId then
+  begin
+    Proc();
+    Exit;
+  end;
+  FFrError := '';
+  FFrRequest := Proc;
+  FFrWorkDone.ResetEvent;
+  FFrWorkAvail.SetEvent;
+  if FFrWorkDone.WaitFor(120000) <> wrSignaled then
+    raise Exception.Create('Таймаут ожидания STA-потока драйвера ККТ');
+  if FFrError <> '' then
+    raise Exception.Create(FFrError);
 end;
 
 procedure TVariantPrint.CheckFRResult(const Place: string);
@@ -461,23 +558,29 @@ begin
 end;
 
 function TVariantPrint.ReadSerialNumber: string;
+var
+  Local: string;
 begin
-  Result:='';
-  if FEmulation then begin
+  Result := '';
+  if FEmulation then
+  begin
     Result := FEmulatedSerial;
     Exit;
   end;
   if VarIsEmpty(ovObject) or VarIsNull(ovObject) then
     Exit;
 
-  try
-    Result := VarToStr(ovObject.SerialNumber);
-  except
-    on E: Exception do
-    begin
-      FLog.LogError('[FR] ReadSerialNumber: ' + E.Message);
+  Local := '';
+  ExecOnFrThread(procedure
+  begin
+    try
+      Local := VarToStr(ovObject.SerialNumber);
+    except
+      on E: Exception do
+        FLog.LogError('[FR] ReadSerialNumber: ' + E.Message);
     end;
-  end;
+  end);
+  Result := Local;
 end;
 
 function TVariantPrint.FRObjectReady: Boolean;
@@ -487,15 +590,18 @@ end;
 
 procedure TVariantPrint.RunFR(const Place: string; const Proc: TProc);
 begin
-  if FEmulation then
+  ExecOnFrThread(procedure
   begin
-    FLog.LogInfo('[FR] ' + Place + ' (emu)');
-    Exit;
-  end;
-  if not FRObjectReady then
-    LogFRSkipped(Place);
-  Proc();
-  CheckFRResult(Place);
+    if FEmulation then
+    begin
+      FLog.LogInfo('[FR] ' + Place + ' (emu)');
+      Exit;
+    end;
+    if not FRObjectReady then
+      LogFRSkipped(Place);
+    Proc();
+    CheckFRResult(Place);
+  end);
 end;
 
 procedure TVariantPrint.LogFRSkipped(const Place: string);
@@ -506,6 +612,8 @@ begin
 end;
 
 function TVariantPrint.ReadCheckNumberAfterClose: Integer;
+var
+  Local: Integer;
 begin
   Result := 0;
   RunFR('GetECRStatus after close', procedure
@@ -521,23 +629,30 @@ begin
   if not FRObjectReady then
     Exit;
 
-  try
-    Result := ovObject.OpenDocumentNumber;
+  Local := 0;
+  ExecOnFrThread(procedure
+  begin
     try
-      if ovObject.ECRAdvancedMode = 5 then
-        Inc(Result);
+      Local := ovObject.OpenDocumentNumber;
+      try
+        if ovObject.ECRAdvancedMode = 5 then
+          Inc(Local);
+      except
+      end;
     except
+      on E: Exception do
+      begin
+        FLog.LogError('[FR] ReadCheckNumberAfterClose: ' + E.Message);
+        raise;
+      end;
     end;
-  except
-    on E: Exception do
-    begin
-      FLog.LogError('[FR] ReadCheckNumberAfterClose: ' + E.Message);
-      raise;
-    end;
-  end;
+  end);
+  Result := Local;
 end;
 
 function TVariantPrint.ReadSessionNumberAfterClose: Integer;
+var
+  Local: Integer;
 begin
   Result := 0;
   RunFR('GetECRStatus after close shift', procedure
@@ -553,20 +668,25 @@ begin
   if not FRObjectReady then
     Exit;
 
-  try
-    Result := ovObject.SessionNumber;
+  Local := 0;
+  ExecOnFrThread(procedure
+  begin
     try
-      if ovObject.ECRAdvancedMode = 5 then
-        Inc(Result);
+      Local := ovObject.SessionNumber;
+      try
+        if ovObject.ECRAdvancedMode = 5 then
+          Inc(Local);
+      except
+      end;
     except
+      on E: Exception do
+      begin
+        FLog.LogError('[FR] ReadSessionNumberAfterClose: ' + E.Message);
+        raise;
+      end;
     end;
-  except
-    on E: Exception do
-    begin
-      FLog.LogError('[FR] ReadSessionNumberAfterClose: ' + E.Message);
-      raise;
-    end;
-  end;
+  end);
+  Result := Local;
 end;
 
 {-------------------------------------------------------------------------------
@@ -574,6 +694,8 @@ end;
 -------------------------------------------------------------------------------}
 
 function TVariantPrint.CheckLinkAlive: Boolean;
+var
+  Local: Boolean;
 begin
   Result := False;
   if not FConnected then
@@ -588,15 +710,20 @@ begin
   if VarIsEmpty(ovObject) or VarIsNull(ovObject) then
     Exit;
 
-  try
-    Result := ovObject.Connected;
-  except
-    on E: Exception do
-    begin
-      FLog.LogError('[FR] CheckLinkAlive: ' + E.Message);
-      Result := False;
+  Local := False;
+  ExecOnFrThread(procedure
+  begin
+    try
+      Local := ovObject.Connected;
+    except
+      on E: Exception do
+      begin
+        FLog.LogError('[FR] CheckLinkAlive: ' + E.Message);
+        Local := False;
+      end;
     end;
-  end;
+  end);
+  Result := Local;
 end;
 
 function TVariantPrint.EnsureFRConnected: Boolean;
@@ -614,7 +741,10 @@ begin
   if VarIsEmpty(ovObject) or VarIsNull(ovObject) then
   begin
     try
-      ovObject := CreateOleObject('AddIn.DrvFR');
+      ExecOnFrThread(procedure
+      begin
+        ovObject := CreateOleObject('AddIn.DrvFR');
+      end);
       FLog.LogInfo('[FR] CreateOleObject AddIn.DrvFR');
     except
       on E: Exception do
@@ -770,22 +900,22 @@ begin
       RunFR('FNGetFiscalizationResult', procedure
       begin
         ovObject.FNGetFiscalizationResult;
+        if not FEmulation and FRObjectReady then
+        begin
+          try Inn := VarToStr(ovObject.INN); except end;
+          try KKTRegistrationNumber := VarToStr(ovObject.KKTRegistrationNumber); except end;
+        end;
       end);
-      if not FEmulation and FRObjectReady then
-      begin
-        try Inn := VarToStr(ovObject.INN); except end;
-        try KKTRegistrationNumber := VarToStr(ovObject.KKTRegistrationNumber); except end;
-      end;
 
       RunFR('FNGetSerial', procedure
       begin
         ovObject.FNGetSerial;
+        if not FEmulation and FRObjectReady then
+        begin
+          try FnNumber := VarToStr(ovObject.SerialNumber); except end;
+          try if FnNumber = '' then FnNumber := VarToStr(ovObject.FiscalStorageNumber); except end;
+        end;
       end);
-      if not FEmulation and FRObjectReady then
-      begin
-        try FnNumber := VarToStr(ovObject.SerialNumber); except end;
-        try if FnNumber = '' then FnNumber := VarToStr(ovObject.FiscalStorageNumber); except end;
-      end;
 
       if FEmulation then begin
        if Inn = '' then Inn := FEmulatedInn;
@@ -1484,7 +1614,13 @@ begin
         end
         else
         begin
-          try ovObject.CancelCheck; except end;
+          try
+            RunFR('CancelCheck after error', procedure
+            begin
+              ovObject.CancelCheck;
+            end);
+          except
+          end;
           ClearMarkCache;
           Result := JsonError(E.Message);
         end;
@@ -1599,10 +1735,10 @@ begin
   FLock.Enter;
   try
     V := nil;
+    Req := nil;
     try
       FLog.LogInfo('CancelCheckJson begin');
       V := TJSONObject.ParseJSONValue(Body);
-      Req := nil;
       if V is TJSONObject then
         Req := TJSONObject(V);
 
@@ -1643,10 +1779,10 @@ begin
   FLock.Enter;
   try
     V := nil;
+    Req := nil;
     try
       FLog.LogInfo('ClearBufferOfMarksJson begin');
       V := TJSONObject.ParseJSONValue(Body);
-      Req := nil;
       if V is TJSONObject then
         Req := TJSONObject(V);
 
@@ -1686,7 +1822,7 @@ end;
 function TVariantPrint.DecodeMarkBase64(const B64: string): string;
 var
   Bytes: TBytes;
-  I: Integer;
+  I, Len, RawLen: Integer;
 begin
   if Trim(B64) = '' then
     raise Exception.Create('Пустая марка (base64)');
@@ -1698,11 +1834,22 @@ begin
       raise Exception.Create('Некорректный base64 марки: ' + E.Message);
   end;
 
-  if Length(Bytes) = 0 then
+  RawLen := Length(Bytes);
+  if RawLen = 0 then
     raise Exception.Create('Декодированная марка пуста');
 
-  SetLength(Result, Length(Bytes));
-  for I := 0 to High(Bytes) do
+  // 1С часто отдаёт КМ из фиксированного поля со пробелами/нулями справа —
+  // в BarCode это ломает FNCheckItemBarcode (часто как -1 «Нет связи»).
+  Len := RawLen;
+  while (Len > 0) and ((Bytes[Len - 1] = Ord(' ')) or (Bytes[Len - 1] = 0)) do
+    Dec(Len);
+  if Len = 0 then
+    raise Exception.Create('Декодированная марка пуста после обрезки хвоста');
+  if Len <> RawLen then
+    FLog.LogInfo(Format('DecodeMarkBase64: обрезан хвост %d→%d', [RawLen, Len]));
+
+  SetLength(Result, Len);
+  for I := 0 to Len - 1 do
     Result[I + 1] := Char(Bytes[I]);
 end;
 
@@ -1972,11 +2119,14 @@ begin
   end;
 
   SessionNotOpen := False;
-  try
-    SessionNotOpen := ovObject.ECRMode = 4;
-  except
-    SessionNotOpen := False;
-  end;
+  ExecOnFrThread(procedure
+  begin
+    try
+      SessionNotOpen := ovObject.ECRMode = 4;
+    except
+      SessionNotOpen := False;
+    end;
+  end);
 
   if not SessionNotOpen then
     Exit;
@@ -2018,6 +2168,11 @@ var
   Accepted: Boolean;
   Desc: string;
   Cached: TMarkCacheEntry;
+  CheckItemLocalResultVal: Integer;
+  CheckItemLocalErrorVal: Integer;
+  MarkingType2Val: Integer;
+  KMServerErrorCodeVal: Integer;
+  KMServerCheckingStatusVal: Integer;
 begin
   if TryGetMarkFromCache(MarkDecoded, ReturnCheck, Cached) and Cached.KktAccepted then
   begin
@@ -2076,52 +2231,34 @@ begin
     Exit;
   end;
 
+  CheckItemLocalResultVal := 0;
+  CheckItemLocalErrorVal := 0;
+  MarkingType2Val := 0;
+  KMServerErrorCodeVal := 0;
+  KMServerCheckingStatusVal := 0;
   ResCheck := 0;
-  try
-    ResCheck := ovObject.CheckItemLocalResult;
-  except
-  end;
-  Result.AddPair('checkItemLocalResult', TJSONNumber.Create(ResCheck));
-  FLog.LogInfo('CheckItemLocalResult=' + IntToStr(ResCheck));
+  Desc := '';
+  ExecOnFrThread(procedure
+  begin
+    try CheckItemLocalResultVal := ovObject.CheckItemLocalResult; except end;
+    try CheckItemLocalErrorVal := ovObject.CheckItemLocalError; except end;
+    try MarkingType2Val := ovObject.MarkingType2; except end;
+    try KMServerErrorCodeVal := ovObject.KMServerErrorCode; except end;
+    try KMServerCheckingStatusVal := ovObject.KMServerCheckingStatus; except end;
+    try ResCheck := ovObject.ResultCode; except end;
+    Desc := FRResultText(ovObject);
+  end);
 
-  ResCheck := 0;
-  try
-    ResCheck := ovObject.CheckItemLocalError;
-  except
-  end;
-  Result.AddPair('checkItemLocalError', TJSONNumber.Create(ResCheck));
-  FLog.LogInfo('CheckItemLocalError=' + IntToStr(ResCheck));
-
-  ResCheck := 0;
-  try
-    ResCheck := ovObject.MarkingType2;
-  except
-  end;
-  Result.AddPair('markingType2', TJSONNumber.Create(ResCheck));
-  FLog.LogInfo('MarkingType2=' + IntToStr(ResCheck));
-
-  ResCheck := 0;
-  try
-    ResCheck := ovObject.KMServerErrorCode;
-  except
-  end;
-  Result.AddPair('kmServerErrorCode', TJSONNumber.Create(ResCheck));
-  FLog.LogInfo('KMServerErrorCode=' + IntToStr(ResCheck));
-
-  ResCheck := 0;
-  try
-    ResCheck := ovObject.KMServerCheckingStatus;
-  except
-  end;
-  Result.AddPair('kmServerCheckingStatus', TJSONNumber.Create(ResCheck));
-  FLog.LogInfo('KMServerCheckingStatus=' + IntToStr(ResCheck));
-
-  ResCheck := 0;
-  try
-    ResCheck := ovObject.ResultCode;
-  except
-  end;
-  Desc := FRResultText(ovObject);
+  Result.AddPair('checkItemLocalResult', TJSONNumber.Create(CheckItemLocalResultVal));
+  FLog.LogInfo('CheckItemLocalResult=' + IntToStr(CheckItemLocalResultVal));
+  Result.AddPair('checkItemLocalError', TJSONNumber.Create(CheckItemLocalErrorVal));
+  FLog.LogInfo('CheckItemLocalError=' + IntToStr(CheckItemLocalErrorVal));
+  Result.AddPair('markingType2', TJSONNumber.Create(MarkingType2Val));
+  FLog.LogInfo('MarkingType2=' + IntToStr(MarkingType2Val));
+  Result.AddPair('kmServerErrorCode', TJSONNumber.Create(KMServerErrorCodeVal));
+  FLog.LogInfo('KMServerErrorCode=' + IntToStr(KMServerErrorCodeVal));
+  Result.AddPair('kmServerCheckingStatus', TJSONNumber.Create(KMServerCheckingStatusVal));
+  FLog.LogInfo('KMServerCheckingStatus=' + IntToStr(KMServerCheckingStatusVal));
   Result.AddPair('resultCode', TJSONNumber.Create(ResCheck));
   Result.AddPair('description', Desc);
 
@@ -2150,6 +2287,8 @@ begin
 end;
 
 procedure TVariantPrint.ReadInnAndFn(out Inn, FnNumber: string);
+var
+  LocalInn, LocalFn: string;
 begin
   Inn := '';
   FnNumber := '';
@@ -2162,28 +2301,34 @@ begin
   if not FRObjectReady then
     Exit;
 
+  LocalInn := '';
+  LocalFn := '';
+
   RunFR('FNGetFiscalizationResult permission', procedure
   begin
     ovObject.FNGetFiscalizationResult;
+    try
+      LocalInn := VarToStr(ovObject.INN);
+    except
+    end;
   end);
-  try
-    Inn := VarToStr(ovObject.INN);
-  except
-  end;
 
   RunFR('FNGetSerial permission', procedure
   begin
     ovObject.FNGetSerial;
+    try
+      LocalFn := VarToStr(ovObject.SerialNumber);
+    except
+    end;
+    try
+      if LocalFn = '' then
+        LocalFn := VarToStr(ovObject.FiscalStorageNumber);
+    except
+    end;
   end);
-  try
-    FnNumber := VarToStr(ovObject.SerialNumber);
-  except
-  end;
-  try
-    if FnNumber = '' then
-      FnNumber := VarToStr(ovObject.FiscalStorageNumber);
-  except
-  end;
+
+  Inn := LocalInn;
+  FnNumber := LocalFn;
 end;
 
 function TVariantPrint.ResolvePermissionInn(Req: TJSONObject): string;

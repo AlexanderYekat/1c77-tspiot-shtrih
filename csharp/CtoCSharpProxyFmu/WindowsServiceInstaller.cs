@@ -9,7 +9,7 @@ public static class WindowsServiceInstaller
     public static async Task InstallAsync()
     {
         var path = Environment.ProcessPath ?? AssemblyPath();
-        var command = $"create {ServiceName} binPath= \"{path}\" start= auto DisplayName= \"CTO CSharp Proxy FMU\"";
+        var command = $"create {ServiceName} binPath= \"{path}\" start= auto DisplayName= \"Прокси FMU и ККТ ТСПиОТ\"";
         await ProcessHelper.RunAsync("sc.exe", command);
         Console.WriteLine("Служба установлена.");
     }
