@@ -1,8 +1,8 @@
 ; Installation script for Delphi KKT server (GUI + HTTP)
 #define MyAppName "KKT Server TSPiOT"
-#define MyAppVersion "2026.07.23.01"
+#define MyAppVersion "2026.07.23.03"
 #define MyAppPublisher "CTO KSM"
-#define MyAppExeName "kktserverindy.exe"
+#define MyAppExeName "kktserverindyProject.exe"
 #define MyAppDirName "kktserver"
 
 [Setup]
@@ -34,8 +34,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "{commonappdata}\CTO_KSM\{#MyAppDirName}"; Permissions: users-modify
 
 [Files]
-; Put Release/Debug build into for_build\kktserver\ before compiling this script
-Source: "for_build\kktserver\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; Берём свежую сборку Delphi (Win32 Debug)
+Source: "Win32\Debug\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 ; Settings live in %ProgramData%\CTO_KSM\kktserver\ (created on first run)
 
 [Icons]
@@ -85,13 +85,13 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
   NeedsRestart := False;
-  EnsureProcessStopped('kktserverindy.exe', 15000);
   EnsureProcessStopped('kktserverindyProject.exe', 15000);
+  EnsureProcessStopped('kktserverindy.exe', 15000);
 end;
 
 function InitializeUninstall(): Boolean;
 begin
   Result := True;
-  EnsureProcessStopped('kktserverindy.exe', 15000);
   EnsureProcessStopped('kktserverindyProject.exe', 15000);
+  EnsureProcessStopped('kktserverindy.exe', 15000);
 end;
