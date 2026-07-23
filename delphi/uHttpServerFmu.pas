@@ -190,6 +190,12 @@ begin
       ResultJson := FVariantPrint.CloseShiftJson(Body);
       WriteJson(AResponseInfo, ResultJson);
     end
+    else if (Method = 'POST') and (Path = '/open-shift') then
+    begin
+      Body := ReadBody(ARequestInfo);
+      ResultJson := FVariantPrint.OpenShiftJson(Body);
+      WriteJson(AResponseInfo, ResultJson);
+    end
     else if (Method = 'POST') and (Path = '/x-report') then
     begin
       Body := ReadBody(ARequestInfo);

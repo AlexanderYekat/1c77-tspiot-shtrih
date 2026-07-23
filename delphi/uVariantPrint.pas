@@ -91,7 +91,13 @@ type
     function DecodeMarkBase64(const B64: string): string;
     function GetReceiptReturnCheck(Req: TJSONObject): Boolean;
     function GetCashierName(Req: TJSONObject): string;
+    function ReadECRMode: Integer;
+    procedure RefreshECRStatus(const Place: string);
+    procedure ClearStuckOpenDocument(const Context: string);
+    procedure DoOpenSession(const CashierName: string);
     procedure EnsureSessionOpen(const CashierName: string);
+    procedure EnsureReadyForXReport;
+    procedure EnsureReadyForZReport;
     function CheckSingleMark(const MarkDecoded: string; ReturnCheck: Boolean): TJSONObject;
     function CheckMarkInternal(const Body: string): string;
     procedure TrimOldMarkTasks;
@@ -137,6 +143,7 @@ type
     function PrintCheckJson(const Body: string): string;
     function CloseShiftJson(const Body: string): string;
     function XReportJson(const Body: string = ''): string;
+    function OpenShiftJson(const Body: string = ''): string;
     function CancelCheckJson(const Body: string = ''): string;
     function DisconnectJson: string;
     function ConnectJson: string;
@@ -397,6 +404,73 @@ begin
   end;
 end;
 
+/// <summary>Человекочитаемое имя режима Штрих ECRMode.</summary>
+function ECRModeCaption(Mode: Integer): string;
+begin
+  case Mode of
+    0: Result := 'принтер в рабочем режиме';
+    1: Result := 'выдача данных';
+    2: Result := 'смена открыта (менее 24 часов)';
+    3: Result := 'смена открыта более 24 часов';
+    4: Result := 'смена закрыта';
+    5: Result := 'блокировка по паролю налогового инспектора';
+    6: Result := 'ожидание подтверждения даты';
+    7: Result := 'разрешение изменения десятичной точки';
+    8: Result := 'открыт документ (чек)';
+    9: Result := 'разрешение технологического обнуления';
+    10: Result := 'тестовый прогон';
+    11: Result := 'печать полного фискального отчёта';
+    12: Result := 'печать длинного отчёта ЭКЛЗ';
+    14: Result := 'работа с фискальным подкладным документом';
+    15: Result := 'переполнение принтера';
+  else
+    Result := 'неизвестный режим ККТ (' + IntToStr(Mode) + ')';
+  end;
+end;
+
+/// <summary>Понятное сообщение, если режим ККТ не позволяет проверку марки / печать.</summary>
+function MessageForBlockedECRMode(Mode: Integer): string;
+begin
+  case Mode of
+    3:
+      Result := 'Смена открыта более 24 часов. Снимите Z-отчёт (закрытие смены) и повторите.';
+    4:
+      Result := 'Смена закрыта. Откройте смену и повторите.';
+    5:
+      Result := 'ККТ заблокирована (пароль налогового инспектора). Обратитесь к администратору.';
+    6:
+      Result := 'ККТ ожидает подтверждения даты. Подтвердите дату на кассе и повторите.';
+    8:
+      Result := 'На ККТ открыт незакрытый чек. Отмените или закройте чек и повторите.';
+    1:
+      Result := 'ККТ занята выдачей данных. Подождите и повторите.';
+    11, 12:
+      Result := 'ККТ печатает отчёт. Дождитесь окончания и повторите.';
+    15:
+      Result := 'Переполнение буфера печати ККТ. Устраните проблему на кассе и повторите.';
+  else
+    Result := 'Операция недоступна: ' + ECRModeCaption(Mode) +
+      '. Приведите ККТ в режим открытой смены и повторите.';
+  end;
+end;
+
+function UserMessageForFRError(const Place: string; Code: Integer;
+  const Desc: string; ECRMode: Integer): string;
+begin
+  // 115 — «Команда не поддерживается в данном режиме»
+  if Code = 115 then
+  begin
+    if ECRMode >= 0 then
+      Result := MessageForBlockedECRMode(ECRMode)
+    else
+      Result :=
+        'ККТ отклонила команду: текущий режим кассы не позволяет выполнить операцию. ' +
+        'Проверьте, что смена открыта (не более 24 часов) и нет незакрытого чека.';
+    Exit;
+  end;
+  Result := Place + ': ' + IntToStr(Code) + ' ' + Desc;
+end;
+
 {-------------------------------------------------------------------------------
  TVariantPrint — конструктор/деструктор
 -------------------------------------------------------------------------------}
@@ -585,8 +659,8 @@ end;
 
 procedure TVariantPrint.CheckFRResult(const Place: string);
 var
-  Code: Integer;
-  Desc: string;
+  Code, Mode: Integer;
+  Desc, UserMsg: string;
 begin
   Code := 0;
   try
@@ -606,7 +680,19 @@ begin
   begin
     FLog.LogError('[FR] ' + Place + ': ' + IntToStr(Code) + ' ' + Desc);
     if not FEmulation then
-      raise Exception.Create(Place + ': ' + IntToStr(Code) + ' ' + Desc);
+    begin
+      Mode := -1;
+      try
+        Mode := ovObject.ECRMode;
+      except
+        Mode := -1;
+      end;
+      UserMsg := UserMessageForFRError(Place, Code, Desc, Mode);
+      if (Code = 115) and (Mode >= 0) then
+        FLog.LogError('[FR] ' + Place + ': ECRMode=' + IntToStr(Mode) +
+          ' (' + ECRModeCaption(Mode) + ')');
+      raise Exception.Create(UserMsg);
+    end;
   end
   else
     FLog.LogDebug('[FR] ' + Place + ': OK');
@@ -1708,6 +1794,8 @@ begin
         Req := TJSONObject(V);
 
       EnsureFRConnected;
+      // Режим 3 (смена > 24 ч) здесь допустим — это как раз повод снять Z
+      EnsureReadyForZReport;
       RunFR('PrintReportWithCleaning', procedure
       begin
         ovObject.PrintReportWithCleaning;
@@ -1756,6 +1844,8 @@ begin
         Req := TJSONObject(V);
 
       EnsureFRConnected;
+      // Режим 3 допустим для X; смену не открываем автоматически
+      EnsureReadyForXReport;
       RunFR('PrintReportWithoutCleaning', procedure
       begin
         ovObject.PrintReportWithoutCleaning;
@@ -1770,6 +1860,92 @@ begin
         if FEmulation then
         begin
           Result := JsonOk;
+          AfterCommand(Req);
+        end
+        else
+          Result := JsonError(E.Message);
+      end;
+    end;
+    V.Free;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TVariantPrint.OpenShiftJson(const Body: string = ''): string;
+var
+  V: TJSONValue;
+  Req: TJSONObject;
+  CashierName: string;
+  Mode, SessionNumber: Integer;
+begin
+  FLock.Enter;
+  try
+    V := nil;
+    try
+      FLog.LogInfo('OpenShiftJson begin');
+      V := TJSONObject.ParseJSONValue(Body);
+      Req := nil;
+      if V is TJSONObject then
+        Req := TJSONObject(V);
+
+      EnsureFRConnected;
+
+      if FEmulation then
+      begin
+        Inc(FEmulatedSessionNumber);
+        Result := JsonOk('"documentNumber":' + IntToStr(FEmulatedSessionNumber));
+        AfterCommand(Req);
+        Exit;
+      end;
+
+      ClearStuckOpenDocument('OpenShift');
+      Mode := ReadECRMode;
+      FLog.LogInfo('OpenShiftJson: ECRMode=' + IntToStr(Mode) +
+        ' (' + ECRModeCaption(Mode) + ')');
+
+      if (Mode = 0) or (Mode = 2) then
+      begin
+        FLog.LogInfo('OpenShiftJson: смена уже открыта');
+        SessionNumber := ReadSessionNumberAfterClose;
+        // ReadSessionNumberAfterClose в эмуляции инкрементирует — здесь не эмуляция
+        Result := JsonOk('"documentNumber":' + IntToStr(SessionNumber) +
+          ',"alreadyOpen":true');
+        AfterCommand(Req);
+        Exit;
+      end;
+
+      if Mode = 3 then
+        raise Exception.Create(MessageForBlockedECRMode(3));
+
+      if Mode <> 4 then
+        raise Exception.Create(MessageForBlockedECRMode(Mode));
+
+      CashierName := '';
+      if Req <> nil then
+      begin
+        CashierName := JStr(Req, 'cashierName');
+        if CashierName = '' then
+          CashierName := GetCashierName(Req);
+      end;
+      DoOpenSession(CashierName);
+
+      Mode := ReadECRMode;
+      if (Mode <> 0) and (Mode <> 2) then
+        raise Exception.Create(MessageForBlockedECRMode(Mode));
+
+      SessionNumber := ReadSessionNumberAfterClose;
+      Result := JsonOk('"documentNumber":' + IntToStr(SessionNumber));
+      FLog.LogInfo('OpenShiftJson OK documentNumber=' + IntToStr(SessionNumber));
+      AfterCommand(Req);
+    except
+      on E: Exception do
+      begin
+        FLog.LogError('OpenShiftJson: ' + E.Message);
+        if FEmulation then
+        begin
+          Inc(FEmulatedSessionNumber);
+          Result := JsonOk('"documentNumber":' + IntToStr(FEmulatedSessionNumber));
           AfterCommand(Req);
         end
         else
@@ -2155,42 +2331,95 @@ begin
   end;
 end;
 
-procedure TVariantPrint.EnsureSessionOpen(const CashierName: string);
+function TVariantPrint.ReadECRMode: Integer;
 var
-  SessionNotOpen: Boolean;
-  Cashier: string;
+  Mode: Integer;
 begin
-  RunFR('GetECRStatus EnsureSessionOpen', procedure
+  Mode := -1;
+  if not FRObjectReady then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  ExecOnFrThread(procedure
+  begin
+    try
+      Mode := ovObject.ECRMode;
+    except
+      Mode := -1;
+    end;
+  end);
+  Result := Mode;
+end;
+
+procedure TVariantPrint.RefreshECRStatus(const Place: string);
+begin
+  RunFR(Place, procedure
   begin
     ovObject.GetECRStatus;
   end);
+end;
 
+procedure TVariantPrint.ClearStuckOpenDocument(const Context: string);
+var
+  Mode: Integer;
+begin
+  RefreshECRStatus('GetECRStatus ' + Context);
   if FEmulation then
     Exit;
   if not FRObjectReady then
   begin
-    LogFRSkipped('EnsureSessionOpen');
+    LogFRSkipped(Context);
     Exit;
   end;
 
-  SessionNotOpen := False;
-  ExecOnFrThread(procedure
-  begin
-    try
-      SessionNotOpen := ovObject.ECRMode = 4;
-    except
-      SessionNotOpen := False;
-    end;
-  end);
+  Mode := ReadECRMode;
+  FLog.LogInfo(Context + ': ECRMode=' + IntToStr(Mode) +
+    ' (' + ECRModeCaption(Mode) + ')');
 
-  if not SessionNotOpen then
+  if Mode <> 8 then
     Exit;
 
+  // Сначала ContinuePrint (докатить прерванную печать), затем CancelCheck
+  FLog.LogInfo(Context + ': открыт документ — пробуем ContinuePrint');
+  try
+    RunFR('ContinuePrint ' + Context, procedure
+    begin
+      ovObject.ContinuePrint;
+    end);
+  except
+    on E: Exception do
+      FLog.LogInfo(Context + ': ContinuePrint не помог — ' + E.Message);
+  end;
+  RefreshECRStatus('GetECRStatus after ContinuePrint ' + Context);
+  Mode := ReadECRMode;
+  FLog.LogInfo(Context + ' after ContinuePrint: ECRMode=' + IntToStr(Mode) +
+    ' (' + ECRModeCaption(Mode) + ')');
+
+  if Mode <> 8 then
+    Exit;
+
+  FLog.LogInfo(Context + ': документ всё ещё открыт — CancelCheck');
+  RunFR('CancelCheck ' + Context, procedure
+  begin
+    ovObject.CancelCheck;
+  end);
+  RefreshECRStatus('GetECRStatus after CancelCheck ' + Context);
+  Mode := ReadECRMode;
+  FLog.LogInfo(Context + ' after CancelCheck: ECRMode=' + IntToStr(Mode) +
+    ' (' + ECRModeCaption(Mode) + ')');
+end;
+
+procedure TVariantPrint.DoOpenSession(const CashierName: string);
+var
+  Cashier: string;
+  Mode: Integer;
+begin
   Cashier := CashierName;
   if Cashier = '' then
     Cashier := FSettings.ReadString('FRCash', 'CashierName', 'Кассир');
 
-  FLog.LogInfo('Смена не открыта — открываем (кассир: ' + Cashier + ')');
+  FLog.LogInfo('Открываем смену (кассир: ' + Cashier + ')');
 
   RunFR('WriteTable cashier', procedure
   begin
@@ -2214,6 +2443,78 @@ begin
   begin
     ovObject.OpenSession;
   end);
+
+  RefreshECRStatus('GetECRStatus after OpenSession');
+  Mode := ReadECRMode;
+  FLog.LogInfo('After OpenSession: ECRMode=' + IntToStr(Mode) +
+    ' (' + ECRModeCaption(Mode) + ')');
+end;
+
+procedure TVariantPrint.EnsureSessionOpen(const CashierName: string);
+var
+  Mode: Integer;
+begin
+  // Для продажи / проверки марки: нужна открытая смена < 24 ч (режимы 0 или 2)
+  ClearStuckOpenDocument('EnsureSessionOpen');
+
+  if FEmulation then
+    Exit;
+  if not FRObjectReady then
+    Exit;
+
+  Mode := ReadECRMode;
+
+  if Mode = 4 then
+  begin
+    DoOpenSession(CashierName);
+    Mode := ReadECRMode;
+  end;
+
+  // 0 — готов; 2 — смена открыта < 24 ч
+  if (Mode = 0) or (Mode = 2) then
+    Exit;
+
+  raise Exception.Create(MessageForBlockedECRMode(Mode));
+end;
+
+procedure TVariantPrint.EnsureReadyForXReport;
+var
+  Mode: Integer;
+begin
+  // X-отчёт: смена должна быть открыта; режим 3 (>24 ч) допустим; смену не открываем
+  ClearStuckOpenDocument('XReport');
+
+  if FEmulation then
+    Exit;
+  if not FRObjectReady then
+    Exit;
+
+  Mode := ReadECRMode;
+  if (Mode = 2) or (Mode = 3) then
+    Exit;
+  if Mode = 4 then
+    raise Exception.Create('Смена закрыта. Откройте смену и повторите X-отчёт.');
+  raise Exception.Create(MessageForBlockedECRMode(Mode));
+end;
+
+procedure TVariantPrint.EnsureReadyForZReport;
+var
+  Mode: Integer;
+begin
+  // Z-отчёт: режимы 2 и 3 допустимы (3 — как раз повод закрыть смену); смену не открываем
+  ClearStuckOpenDocument('ZReport');
+
+  if FEmulation then
+    Exit;
+  if not FRObjectReady then
+    Exit;
+
+  Mode := ReadECRMode;
+  if (Mode = 2) or (Mode = 3) then
+    Exit;
+  if Mode = 4 then
+    raise Exception.Create('Смена уже закрыта.');
+  raise Exception.Create(MessageForBlockedECRMode(Mode));
 end;
 
 function TVariantPrint.CheckSingleMark(const MarkDecoded: string;
