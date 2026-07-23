@@ -6,7 +6,7 @@ uses
   System.SysUtils, System.Variants, System.JSON, System.IniFiles,
   System.SyncObjs, System.NetEncoding, System.Generics.Collections,
   System.Classes, System.DateUtils, Winapi.Windows, Winapi.ActiveX,
-  ComObj, uKktLog;
+  ComObj, uKktLog, uFormSettings;
 
 type
   TCheckMarkTaskEntry = class
@@ -409,7 +409,7 @@ begin
   FMarkTasksLock := TCriticalSection.Create;
   FMarkTasks := TObjectDictionary<string, TCheckMarkTaskEntry>.Create([doOwnsValues]);
   FMarkCache := TDictionary<string, TMarkCacheEntry>.Create;
-  FLog := TKktLogger.Create(ASettings, ChangeFileExt(ParamStr(0), '.log'));
+  FLog := TKktLogger.Create(ASettings, TFormSettings.GetDefaultLogFileName);
   ovObject := Unassigned;
   FConnected := False;
   FFrStop := False;

@@ -75,6 +75,10 @@ type
     function BaudToComboIndex(Baud: Integer): Integer;
     function ComboIndexToBaud(Index: Integer): Integer;
   public
+    /// <summary>%ProgramData%\CTO_KSM\kktserver — без прав админа.</summary>
+    class function GetDataDirectory: string;
+    class function GetSettingsFileName: string;
+    class function GetDefaultLogFileName: string;
     class function Execute(ASettings: TCustomIniFile; ServerRunning: Boolean): Boolean;
     /// <summary>Записывает полный набор настроек по умолчанию (первый запуск).</summary>
     class procedure WriteDefaultSettings(ASettings: TCustomIniFile;
@@ -159,7 +163,7 @@ begin
   chkLogEnabled.Checked := FSettings.ReadBool('Log', 'Enabled', True);
   chkLogUiEnabled.Checked := FSettings.ReadBool('Log', 'UiEnabled', True);
   seLogUiMaxLines.Value := FSettings.ReadInteger('Log', 'UiMaxLines', DefaultUiMaxLines);
-  edLogPath.Text := FSettings.ReadString('Log', 'Path', 'kktserver.log');
+  edLogPath.Text := FSettings.ReadString('Log', 'Path', GetDefaultLogFileName);
   seLogMaxBodyLen.Value := FSettings.ReadInteger('Log', 'MaxBodyLen', DefaultMaxBodyLen);
 
   LevelStr := LowerCase(Trim(FSettings.ReadString('Log', 'Level', 'info')));
@@ -253,14 +257,14 @@ var
 begin
   FileName := Trim(edLogPath.Text);
   if FileName = '' then
-    FileName := 'kktserver.log';
+    FileName := GetDefaultLogFileName;
 
   dlgSaveLog.FileName := ExtractFileName(FileName);
   Dir := ExtractFilePath(FileName);
   if (Dir <> '') and DirectoryExists(Dir) then
     dlgSaveLog.InitialDir := Dir
   else
-    dlgSaveLog.InitialDir := ExtractFilePath(ParamStr(0));
+    dlgSaveLog.InitialDir := GetDataDirectory;
 
   if dlgSaveLog.Execute then
     edLogPath.Text := dlgSaveLog.FileName;
@@ -272,6 +276,27 @@ begin
     ModalResult := mrNone
   else
     ModalResult := mrOk;
+end;
+
+class function TFormSettings.GetDataDirectory: string;
+var
+  ProgramData: string;
+begin
+  ProgramData := GetEnvironmentVariable('PROGRAMDATA');
+  if ProgramData = '' then
+    ProgramData := 'C:\ProgramData';
+  Result := IncludeTrailingPathDelimiter(ProgramData) + 'CTO_KSM\kktserver';
+  ForceDirectories(Result);
+end;
+
+class function TFormSettings.GetSettingsFileName: string;
+begin
+  Result := IncludeTrailingPathDelimiter(GetDataDirectory) + 'kktserverindy.ini';
+end;
+
+class function TFormSettings.GetDefaultLogFileName: string;
+begin
+  Result := IncludeTrailingPathDelimiter(GetDataDirectory) + 'kktserver.log';
 end;
 
 class function TFormSettings.Execute(ASettings: TCustomIniFile; ServerRunning: Boolean): Boolean;
@@ -321,7 +346,7 @@ begin
   ASettings.WriteBool('Log', 'Enabled', True);
   ASettings.WriteBool('Log', 'UiEnabled', True);
   ASettings.WriteInteger('Log', 'UiMaxLines', DefaultUiMaxLines);
-  ASettings.WriteString('Log', 'Path', 'kktserver.log');
+  ASettings.WriteString('Log', 'Path', GetDefaultLogFileName);
   ASettings.WriteString('Log', 'Level', 'info');
   ASettings.WriteInteger('Log', 'MaxBodyLen', DefaultMaxBodyLen);
 

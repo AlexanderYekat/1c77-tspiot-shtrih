@@ -1,6 +1,6 @@
 ; Installation script for proxy service
 #define MyAppName "cto_csharp_proxyfmu"
-#define MyAppVersion "4.0"
+#define MyAppVersion "2026.07.23.03"
 #define MyAppPublisher "CTO CSharp"
 #define MyAppExeName "cto_csharp_proxyfmu.exe"
 
@@ -23,8 +23,16 @@ Compression=lzma
 SolidCompression=yes
 ; Administrator rights required for service installation
 PrivilegesRequired=admin
+; Silent-friendly: close locked apps without prompting (needed for /SILENT|/VERYSILENT)
+CloseApplications=force
+RestartApplications=no
 ; Minimum supported Windows version
 MinVersion=6.1sp1
+; Silent examples (run elevated):
+;   cto_csharp_proxyfmu_setup.exe /VERYSILENT /SUPPRESSMSGBOXES
+;   cto_csharp_proxyfmu_setup.exe /SILENT
+; Uninstall silent:
+;   {uninstallexe} /VERYSILENT /SUPPRESSMSGBOXES
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -58,6 +66,64 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "stop"; Flags: runhidden waitunti
 Filename: "{app}\{#MyAppExeName}"; Parameters: "uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "UninstallService"
 
 [Code]
+function IsProcessRunning(const ImageName: String): Boolean;
+var
+  ResultCode: Integer;
+begin
+  // find exit code 0 = process listed by tasklist
+  Exec(
+    ExpandConstant('{cmd}'),
+    '/C tasklist /NH /FI "IMAGENAME eq ' + ImageName + '" 2>nul | find /I "' + ImageName + '" >nul',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := ResultCode = 0;
+end;
+
+procedure WaitForProcessExit(const ImageName: String; TimeoutMs: Integer);
+var
+  Elapsed: Integer;
+begin
+  Elapsed := 0;
+  while (Elapsed < TimeoutMs) and IsProcessRunning(ImageName) do
+  begin
+    Sleep(500);
+    Elapsed := Elapsed + 500;
+  end;
+end;
+
+procedure EnsureProcessStopped(const ImageName: String; TimeoutMs: Integer);
+var
+  ResultCode: Integer;
+begin
+  WaitForProcessExit(ImageName, TimeoutMs);
+  // Last resort if graceful stop timed out — required for silent install
+  // (no "files in use" UI under /SILENT|/VERYSILENT)
+  if IsProcessRunning(ImageName) then
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM "' + ImageName + '" /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure StopAndDeleteService(const ServiceName: String);
+var
+  ResultCode: Integer;
+begin
+  // Stop service (ignore errors if it does not exist or is already stopped)
+  Exec(ExpandConstant('{sys}\sc.exe'), 'stop "' + ServiceName + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // Delete service (ignore errors if it does not exist)
+  Exec(ExpandConstant('{sys}\sc.exe'), 'delete "' + ServiceName + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+// Stop and remove old/conflicting services before files are installed
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  NeedsRestart := False;
+  StopAndDeleteService('CtoCSharpProxyFmu');
+  StopAndDeleteService('cto_ksm_proxyfmu');
+  StopAndDeleteService('cto_csharp_proxyfmu');
+  // Prefer graceful shutdown; force-kill only after timeout (silent-safe)
+  EnsureProcessStopped('cto_csharp_proxyfmu.exe', 30000);
+  EnsureProcessStopped('CtoCSharpProxyFmu.exe', 5000);
+end;
+
 // Function to check if service is running before uninstallation
 function InitializeUninstall(): Boolean;
 var
@@ -74,5 +140,4 @@ end;
 function InitializeSetup(): Boolean;
 begin
   Result := True;
-  // Additional pre-installation checks can be added here
 end;

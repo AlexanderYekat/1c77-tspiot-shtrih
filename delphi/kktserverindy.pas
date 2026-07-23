@@ -100,7 +100,8 @@ begin
   if Assigned(FSettings) then
     Exit;
 
-  IniPath := ChangeFileExt(Application.ExeName, '.ini');
+  // ProgramData — без прав админа (в Program Files писать нельзя)
+  IniPath := TFormSettings.GetSettingsFileName;
   IsFirstRun := not FileExists(IniPath);
   FSettings := TIniFile.Create(IniPath);
 
@@ -116,11 +117,11 @@ begin
   if LdOk then
     FFirstRunMessage := Format(
       'Первый запуск: создан %s (COM=%d, Baud=%d из активного ЛУ)',
-      [ExtractFileName(IniPath), FrPort, FrBaud])
+      [IniPath, FrPort, FrBaud])
   else
     FFirstRunMessage := Format(
       'Первый запуск: создан %s (COM=%d, Baud=%d по умолчанию; активное ЛУ не прочитано)',
-      [ExtractFileName(IniPath), FrPort, FrBaud]);
+      [IniPath, FrPort, FrBaud]);
 end;
 
 procedure TkktServerIndyForm.OptionsButtonClick(Sender: TObject);

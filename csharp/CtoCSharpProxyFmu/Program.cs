@@ -1,4 +1,5 @@
 using System.Net.WebSockets;
+using System.Reflection;
 using System.Runtime.Versioning;
 using System.Text.Json;
 using Microsoft.Extensions.FileProviders;
@@ -184,19 +185,37 @@ public static class Program
         app.Lifetime.ApplicationStarted.Register(() =>
         {
             var config = configService.Current;
+            var version = GetServiceVersion();
             var logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("ProxyStartup");
             var logHub = app.Services.GetRequiredService<RequestLogHub>();
             logger.LogInformation(
-                "Proxy запущен на порту {SourcePort}. FMU: {TargetHost}:{TargetPort}. KKT: {KktHost}:{KktPort}",
+                "Proxy v{Version} запущен на порту {SourcePort}. FMU: {TargetHost}:{TargetPort}. KKT: {KktHost}:{KktPort}",
+                version,
                 config.SourcePort,
                 config.TargetHost,
                 config.TargetPort,
                 config.KktHost,
                 config.KktPort);
-            logHub.Log($"Служба запущена. FMU: {config.TargetHost}:{config.TargetPort}, KKT: {config.KktHost}:{config.KktPort}");
+            logHub.Log($"Служба v{version} запущена. FMU: {config.TargetHost}:{config.TargetPort}, KKT: {config.KktHost}:{config.KktPort}");
         });
 
         await app.RunAsync();
+    }
+
+    private static string GetServiceVersion()
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        var informational = assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+            ?.InformationalVersion;
+        if (!string.IsNullOrWhiteSpace(informational))
+        {
+            // Strip optional "+<commit>" suffix from InformationalVersion
+            var plusIndex = informational.IndexOf('+');
+            return plusIndex >= 0 ? informational[..plusIndex] : informational;
+        }
+
+        return assembly.GetName().Version?.ToString() ?? "0.0.0.0";
     }
 
     private static string ResolveStaticPath()
