@@ -7,6 +7,15 @@ uses
   Vcl.Graphics, Vcl.Controls, Vcl.Forms, Vcl.Dialogs, Vcl.StdCtrls,
   Vcl.ExtCtrls, Vcl.ComCtrls, Vcl.Samples.Spin;
 
+const
+  DefaultHttpPort = 2580;
+  DefaultFrPort = 1;
+  DefaultFrBaud = 6;
+  DefaultFrPassword = 30;
+  DefaultCashierName = 'Кассир';
+  DefaultUiMaxLines = 2000;
+  DefaultMaxBodyLen = 4096;
+
 type
   TFormSettings = class(TForm)
     ScrollBox: TScrollBox;
@@ -67,19 +76,14 @@ type
     function ComboIndexToBaud(Index: Integer): Integer;
   public
     class function Execute(ASettings: TCustomIniFile; ServerRunning: Boolean): Boolean;
+    /// <summary>Записывает полный набор настроек по умолчанию (первый запуск).</summary>
+    class procedure WriteDefaultSettings(ASettings: TCustomIniFile;
+      FrPort: Integer = DefaultFrPort; FrBaud: Integer = DefaultFrBaud);
   end;
 
 implementation
 
 {$R *.dfm}
-
-const
-  DefaultHttpPort = 2580;
-  DefaultFrPort = 1;
-  DefaultFrBaud = 6;
-  DefaultFrPassword = 30;
-  DefaultUiMaxLines = 2000;
-  DefaultMaxBodyLen = 4096;
 
 procedure TFormSettings.FormCreate(Sender: TObject);
 begin
@@ -285,6 +289,43 @@ begin
   finally
     Form.Free;
   end;
+end;
+
+class procedure TFormSettings.WriteDefaultSettings(ASettings: TCustomIniFile;
+  FrPort, FrBaud: Integer);
+begin
+  if ASettings = nil then
+    Exit;
+
+  if FrPort < 1 then
+    FrPort := DefaultFrPort;
+  if (FrBaud < 0) or (FrBaud > 9) then
+    FrBaud := DefaultFrBaud;
+
+  ASettings.WriteInteger('HttpServer', 'Port', DefaultHttpPort);
+
+  ASettings.WriteInteger('FRCash', 'Port', FrPort);
+  ASettings.WriteInteger('FRCash', 'Baud', FrBaud);
+  ASettings.WriteInteger('FRCash', 'Password', DefaultFrPassword);
+  ASettings.WriteString('FRCash', 'CashierName', DefaultCashierName);
+
+  ASettings.WriteBool('KKT', 'Emulation', False);
+  ASettings.WriteBool('KKT', 'TestReceiptMode', False);
+  ASettings.WriteString('KKT', 'EmulatedSerial', '0000000000000001');
+  ASettings.WriteString('KKT', 'EmulatedInn', '1234567890');
+  ASettings.WriteString('KKT', 'EmulatedRegNumber', '1234567111890');
+  ASettings.WriteString('KKT', 'EmulatedFnNumber', '9999078900000001');
+  ASettings.WriteInteger('KKT', 'EmulatedCheckNumber', 0);
+  ASettings.WriteInteger('KKT', 'EmulatedSessionNumber', 0);
+
+  ASettings.WriteBool('Log', 'Enabled', True);
+  ASettings.WriteBool('Log', 'UiEnabled', True);
+  ASettings.WriteInteger('Log', 'UiMaxLines', DefaultUiMaxLines);
+  ASettings.WriteString('Log', 'Path', 'kktserver.log');
+  ASettings.WriteString('Log', 'Level', 'info');
+  ASettings.WriteInteger('Log', 'MaxBodyLen', DefaultMaxBodyLen);
+
+  ASettings.UpdateFile;
 end;
 
 end.

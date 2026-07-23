@@ -26,6 +26,7 @@ type
     FSettings: TIniFile;
     FListenPort: Integer;
     FUiLogMaxLines: Integer;
+    FFirstRunMessage: string;
     procedure AppendLogLine(const Line: string);
     procedure HandleLogLine(Sender: TObject; const Line: string);
     procedure BindLoggerUi;
@@ -90,9 +91,36 @@ begin
 end;
 
 procedure TkktServerIndyForm.EnsureSettings;
+var
+  IniPath: string;
+  IsFirstRun: Boolean;
+  FrPort, FrBaud: Integer;
+  LdOk: Boolean;
 begin
-  if not Assigned(FSettings) then
-    FSettings := TIniFile.Create(ChangeFileExt(Application.ExeName, '.ini'));
+  if Assigned(FSettings) then
+    Exit;
+
+  IniPath := ChangeFileExt(Application.ExeName, '.ini');
+  IsFirstRun := not FileExists(IniPath);
+  FSettings := TIniFile.Create(IniPath);
+
+  if not IsFirstRun then
+    Exit;
+
+  // Первый запуск: настройки по умолчанию + параметры связи из активного ЛУ драйвера
+  FrPort := DefaultFrPort;
+  FrBaud := DefaultFrBaud;
+  LdOk := TVariantPrint.TryReadActiveLdConnection(FrPort, FrBaud);
+  TFormSettings.WriteDefaultSettings(FSettings, FrPort, FrBaud);
+
+  if LdOk then
+    FFirstRunMessage := Format(
+      'Первый запуск: создан %s (COM=%d, Baud=%d из активного ЛУ)',
+      [ExtractFileName(IniPath), FrPort, FrBaud])
+  else
+    FFirstRunMessage := Format(
+      'Первый запуск: создан %s (COM=%d, Baud=%d по умолчанию; активное ЛУ не прочитано)',
+      [ExtractFileName(IniPath), FrPort, FrBaud]);
 end;
 
 procedure TkktServerIndyForm.OptionsButtonClick(Sender: TObject);
@@ -138,6 +166,11 @@ begin
       LogsMemo.Lines.EndUpdate;
     end;
     HttpServer.Start;
+    if FFirstRunMessage <> '' then
+    begin
+      FVariantPrint.Logger.LogInfo(FFirstRunMessage);
+      FFirstRunMessage := '';
+    end;
     FVariantPrint.Logger.LogInfo(Format('HTTP-сервер запущен на порту %d', [KktPort]));
   end;
   ButtonStartServer.Caption := Format('Сервер запущен (%d)', [KktPort]);

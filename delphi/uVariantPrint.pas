@@ -144,6 +144,12 @@ type
     function CheckMarkJson(const Body: string): string;
     function CheckMarkStatusJson(const TaskId: string): string;
 
+    /// <summary>
+    /// Читает параметры связи активного ЛУ через GetActiveLD + GetParamLD
+    /// (LDComNumber, LDBaudrate). Без Connect к ККТ.
+    /// </summary>
+    class function TryReadActiveLdConnection(out ComNumber, BaudRate: Integer): Boolean;
+
     property Logger: TKktLogger read FLog;
     property Emulation: Boolean read FEmulation;
   end;
@@ -431,6 +437,55 @@ begin
     FLog.LogInfo('Боевой режим ККТ');
   if FTestReceiptMode then
     FLog.LogInfo('Тестовый режим чека: вместо FNCloseCheckEx будет CancelCheck');
+end;
+
+class function TVariantPrint.TryReadActiveLdConnection(out ComNumber, BaudRate: Integer): Boolean;
+var
+  Drv: OleVariant;
+  NeedUninit: Boolean;
+  Hr: HRESULT;
+  LdNum, LdCom, LdBaud: Integer;
+begin
+  Result := False;
+  ComNumber := 1;
+  BaudRate := 6;
+
+  Hr := CoInitializeEx(nil, COINIT_APARTMENTTHREADED);
+  NeedUninit := (Hr = S_OK) or (Hr = S_FALSE);
+  try
+    try
+      Drv := CreateOleObject('AddIn.DrvFR');
+    except
+      on E: Exception do
+        Exit;
+    end;
+
+    try
+      // GetActiveLD → LDNumber / LDIndex активного логического устройства
+      Drv.GetActiveLD;
+      LdNum := Integer(Drv.LDNumber);
+      if LdNum < 1 then
+        Exit;
+
+      // GetParamLD → параметры ЛУ с номером LDNumber
+      Drv.GetParamLD;
+      LdCom := Integer(Drv.LDComNumber);
+      LdBaud := Integer(Drv.LDBaudrate);
+
+      if LdCom < 1 then
+        Exit;
+
+      ComNumber := LdCom;
+      if (LdBaud >= 0) and (LdBaud <= 9) then
+        BaudRate := LdBaud;
+      Result := True;
+    finally
+      Drv := Unassigned;
+    end;
+  finally
+    if NeedUninit then
+      CoUninitialize;
+  end;
 end;
 
 destructor TVariantPrint.Destroy;
