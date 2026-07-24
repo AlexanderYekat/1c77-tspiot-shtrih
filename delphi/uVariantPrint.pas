@@ -85,6 +85,11 @@ type
     procedure PrintReceiptText(const Text: string);
     procedure ApplyReceiptHeader(Req: TJSONObject; ReturnCheck: Boolean);
     procedure CloseReceiptFromJson(Req: TJSONObject);
+    /// <summary>
+    /// Отрез чека с ожиданием кода 80 («Идет печать предыдущей команды»),
+    /// как в ОтрезатьЧек() драйвера 1С (fr_elves).
+    /// </summary>
+    procedure CutCheckWithWait;
 
     procedure AfterCommand(Req: TJSONObject);
 
@@ -1660,6 +1665,70 @@ begin
   ClearMarkCache;
 end;
 
+procedure TVariantPrint.CutCheckWithWait;
+const
+  FR_BUSY_PRINTING = 80;
+  MaxAttempts = 300; // ~30 с при Sleep(100)
+  RetryDelayMs = 100;
+var
+  Attempt, Code: Integer;
+  Desc: string;
+begin
+  if FEmulation then
+  begin
+    FLog.LogInfo('[FR] CutCheck (emu)');
+    Exit;
+  end;
+
+  Attempt := 0;
+  while True do
+  begin
+    Inc(Attempt);
+    Code := -1;
+    Desc := '';
+    ExecOnFrThread(procedure
+    begin
+      if not FRObjectReady then
+        LogFRSkipped('CutCheck');
+      ovObject.CutType := 1;
+      ovObject.CutCheck;
+      try
+        Code := ovObject.ResultCode;
+      except
+        on E: Exception do
+        begin
+          FLog.LogError('[FR] CutCheck: не удалось прочитать ResultCode — ' + E.Message);
+          raise;
+        end;
+      end;
+      Desc := FRResultText(ovObject);
+    end);
+
+    if Code = 0 then
+    begin
+      if Attempt > 1 then
+        FLog.LogInfo(Format('[FR] CutCheck: OK после ожидания печати (попытка %d)', [Attempt]))
+      else
+        FLog.LogDebug('[FR] CutCheck: OK');
+      Exit;
+    end;
+
+    if Code = FR_BUSY_PRINTING then
+    begin
+      if Attempt = 1 then
+        FLog.LogInfo('[FR] CutCheck: ждём окончания печати (код 80)...');
+      if Attempt >= MaxAttempts then
+        raise Exception.Create(
+          'CutCheck: 80 Идет печать предыдущей команды (таймаут ожидания)');
+      Sleep(RetryDelayMs);
+      Continue;
+    end;
+
+    FLog.LogError('[FR] CutCheck: ' + IntToStr(Code) + ' ' + Desc);
+    raise Exception.Create(UserMessageForFRError('CutCheck', Code, Desc, -1));
+  end;
+end;
+
 function TVariantPrint.PrintCheckJson(const Body: string): string;
 var
   Req, Item: TJSONObject;
@@ -1718,12 +1787,18 @@ begin
         CheckNumber := ReadCheckNumberAfterClose;
         SerialNumber := ReadSerialNumber;
 
+        // Отрез — после успешного FNCloseCheckEx. Код 80 ждём (как в 1С).
+        // Ошибку отреза не поднимаем наружу: чек уже фискально закрыт,
+        // иначе клиент получит result=0 и может напечатать чек повторно.
         if not FTestReceiptMode then
-          RunFR('CutCheck', procedure
-          begin
-            ovObject.CutType := 1;
-            ovObject.CutCheck;
-          end)
+        begin
+          try
+            CutCheckWithWait;
+          except
+            on E: Exception do
+              FLog.LogError('PrintCheckJson: отрез не выполнен — ' + E.Message);
+          end;
+        end
         else
           FLog.LogInfo('Тестовый режим: CutCheck пропущен');
 
@@ -1836,10 +1911,10 @@ begin
   FLock.Enter;
   try
     V := nil;
+    Req := nil;
     try
       FLog.LogInfo('XReportJson begin');
       V := TJSONObject.ParseJSONValue(Body);
-      Req := nil;
       if V is TJSONObject then
         Req := TJSONObject(V);
 
@@ -1882,10 +1957,10 @@ begin
   FLock.Enter;
   try
     V := nil;
+    Req := nil;
     try
       FLog.LogInfo('OpenShiftJson begin');
       V := TJSONObject.ParseJSONValue(Body);
-      Req := nil;
       if V is TJSONObject then
         Req := TJSONObject(V);
 
@@ -2050,10 +2125,56 @@ end;
  Проверка маркировки (FNCheckItemBarcode)
 -------------------------------------------------------------------------------}
 
+function KmServerErrorCodeText(Code: Integer): string;
+begin
+  case Code of
+    1: Result := 'КИЗ отсутствует в базе СКЗКМ/ИСМ';
+    2: Result := 'Некорректен формат КИЗ';
+    3: Result := 'Криптографическая проверка КПКИЗ отрицательная';
+    4: Result := 'Статус КИЗ не совместим с запрашиваемым изменением';
+    5: Result := 'В списке вложения обнаружены ошибки';
+  else
+    Result := 'KMServerErrorCode=' + IntToStr(Code);
+  end;
+end;
+
+/// <summary>КМ для лога: GS→&lt;GS&gt;, прочие control→\xHH (чтобы видеть, что реально ушло в ФН).</summary>
+function MarkForLog(const Mark: string): string;
+var
+  I, Code, GsCount: Integer;
+  C: Char;
+  View, HexTail: string;
+begin
+  View := '';
+  GsCount := 0;
+  for I := 1 to Length(Mark) do
+  begin
+    C := Mark[I];
+    Code := Ord(C);
+    if C = #$1D then
+    begin
+      Inc(GsCount);
+      View := View + '<GS>';
+    end
+    else if (Code < 32) or (Code = 127) then
+      View := View + Format('\x%.2X', [Code])
+    else
+      View := View + C;
+  end;
+
+  HexTail := '';
+  for I := 1 to Length(Mark) do
+    HexTail := HexTail + Format('%.2X', [Ord(Mark[I])]);
+
+  Result := Format('len=%d gs=%d view="%s" hex=%s',
+    [Length(Mark), GsCount, View, HexTail]);
+end;
+
 function TVariantPrint.DecodeMarkBase64(const B64: string): string;
 var
   Bytes: TBytes;
   I, Len, RawLen: Integer;
+  HasGS: Boolean;
 begin
   if Trim(B64) = '' then
     raise Exception.Create('Пустая марка (base64)');
@@ -2082,6 +2203,20 @@ begin
   SetLength(Result, Len);
   for I := 0 to Len - 1 do
     Result[I + 1] := Char(Bytes[I]);
+
+  // В 1С GS (Chr29) часто хранят как литерал "0029" — ФН ждёт #$1D, иначе 211.
+  HasGS := False;
+  for I := 1 to Length(Result) do
+    if Result[I] = #$1D then
+    begin
+      HasGS := True;
+      Break;
+    end;
+  if (not HasGS) and (Pos('0029', Result) > 0) then
+  begin
+    Result := StringReplace(Result, '0029', #$1D, [rfReplaceAll]);
+    FLog.LogInfo(Format('DecodeMarkBase64: "0029"→GS, len %d→%d', [Len, Length(Result)]));
+  end;
 end;
 
 function TVariantPrint.NewTaskId: string;
@@ -2236,8 +2371,8 @@ begin
     for I := 0 to High(MarksB64) do
     begin
       MarkDecoded := DecodeMarkBase64(MarksB64[I]);
-      FLog.LogInfo(Format('pre-flight марка [%d/%d], len=%d',
-        [I + 1, Length(MarksB64), Length(MarkDecoded)]));
+      FLog.LogInfo(Format('pre-flight марка [%d/%d]: %s',
+        [I + 1, Length(MarksB64), MarkForLog(MarkDecoded)]));
 
       if IsMarkFullyOk(MarkDecoded, ReturnCheck, CheckPermission) then
       begin
@@ -2523,24 +2658,30 @@ var
   ResCheck: Integer;
   Accepted: Boolean;
   Desc: string;
+  Warning: string;
   Cached: TMarkCacheEntry;
   CheckItemLocalResultVal: Integer;
   CheckItemLocalErrorVal: Integer;
   MarkingType2Val: Integer;
   KMServerErrorCodeVal: Integer;
   KMServerCheckingStatusVal: Integer;
+  KmChecked: Boolean;
+  KpPositive: Boolean;
+  OismReceived: Boolean;
+  Autonomous: Boolean;
 begin
   if TryGetMarkFromCache(MarkDecoded, ReturnCheck, Cached) and Cached.KktAccepted then
   begin
-    FLog.LogInfo('check-marks: марка из кэша — skip FNCheckItemBarcode, len=' +
-      IntToStr(Length(MarkDecoded)) + ', desc=' + Cached.KktDescription);
+    FLog.LogInfo('check-marks: марка из кэша — skip FNCheckItemBarcode, ' +
+      MarkForLog(MarkDecoded) + ', desc=' + Cached.KktDescription);
     Result := MarkObjFromCacheEntry(Cached);
     Exit;
   end;
 
   Result := TJSONObject.Create;
+  Warning := '';
 
-  FLog.LogInfo('FNCheckItemBarcode begin, len=' + IntToStr(Length(MarkDecoded)));
+  FLog.LogInfo('FNCheckItemBarcode begin: ' + MarkForLog(MarkDecoded));
   RunFR('FNCheckItemBarcode', procedure
   begin
     if ReturnCheck then
@@ -2615,13 +2756,47 @@ begin
   FLog.LogInfo('KMServerErrorCode=' + IntToStr(KMServerErrorCodeVal));
   Result.AddPair('kmServerCheckingStatus', TJSONNumber.Create(KMServerCheckingStatusVal));
   FLog.LogInfo('KMServerCheckingStatus=' + IntToStr(KMServerCheckingStatusVal));
-  Result.AddPair('resultCode', TJSONNumber.Create(ResCheck));
-  Result.AddPair('description', Desc);
+
+  // Тег 2106 (KMServerCheckingStatus), биты:
+  // 0=проверен, 1=КП КМ+, 2=статус ОИСМ получен, 4=автономный режим.
+  // Нет связи / нет ответа ОИСМ: биты 2–3 = 0; продажу не блокируем (предупреждение).
+  // Отказ: явная ошибка сервера КМ (1..5) или КМ проверен и КП отрицательный.
+  KmChecked := (KMServerCheckingStatusVal and 1) <> 0;
+  KpPositive := (KMServerCheckingStatusVal and 2) <> 0;
+  OismReceived := (KMServerCheckingStatusVal and 4) <> 0;
+  Autonomous := (KMServerCheckingStatusVal and 16) <> 0;
 
   if ResCheck <> 0 then
   begin
     Accepted := False;
-    FLog.LogError('Ошибка проверки марки: ' + IntToStr(ResCheck) + ' ' + Desc);
+    FLog.LogError(Format('Отказ марки: ResultCode=%d %s | %s',
+      [ResCheck, Desc, MarkForLog(MarkDecoded)]));
+    RunFR('FNDeclineMarkingCode', procedure
+    begin
+      ovObject.FNDeclineMarkingCode;
+      FLog.LogDebug('[FR] FNDeclineMarkingCode: ' + FRResultText(ovObject));
+    end);
+  end
+  else if (KMServerErrorCodeVal >= 1) and (KMServerErrorCodeVal <= 5) then
+  begin
+    Accepted := False;
+    Desc := Format('%s (KMServerErrorCode=%d, KMServerCheckingStatus=%d)',
+      [KmServerErrorCodeText(KMServerErrorCodeVal), KMServerErrorCodeVal,
+       KMServerCheckingStatusVal]);
+    FLog.LogError('Отказ марки: ' + Desc + ' | ' + MarkForLog(MarkDecoded));
+    RunFR('FNDeclineMarkingCode', procedure
+    begin
+      ovObject.FNDeclineMarkingCode;
+      FLog.LogDebug('[FR] FNDeclineMarkingCode: ' + FRResultText(ovObject));
+    end);
+  end
+  else if KmChecked and not KpPositive then
+  begin
+    Accepted := False;
+    Desc := Format(
+      'КП КМ отрицательный (KMServerCheckingStatus=%d) — на чеке будет M-',
+      [KMServerCheckingStatusVal]);
+    FLog.LogError('Отказ марки: ' + Desc + ' | ' + MarkForLog(MarkDecoded));
     RunFR('FNDeclineMarkingCode', procedure
     begin
       ovObject.FNDeclineMarkingCode;
@@ -2636,9 +2811,32 @@ begin
       ovObject.FNAcceptMarkingCode;
       FLog.LogDebug('[FR] FNAcceptMarkingCode: ' + FRResultText(ovObject));
     end);
+    FLog.LogInfo('Марка принята ККТ: ' + MarkForLog(MarkDecoded));
+
+    if not KmChecked then
+      Warning := Format(
+        'КМ не проверен ФН/ОИСМ (KMServerCheckingStatus=%d); продажа разрешена, на чеке возможно [M]',
+        [KMServerCheckingStatusVal])
+    else if (not OismReceived) or Autonomous then
+      Warning := Format(
+        'Статус ОИСМ не получен / автономный режим (KMServerCheckingStatus=%d); продажа разрешена, на чеке возможно [M]',
+        [KMServerCheckingStatusVal]);
+
+    if Warning <> '' then
+    begin
+      FLog.LogInfo('предупреждение: ' + Warning + ' | ' + MarkForLog(MarkDecoded));
+      if (Desc = '') or SameText(Trim(Desc), 'OK') or SameText(Trim(Desc), 'Ошибок нет') then
+        Desc := Warning
+      else
+        Desc := Desc + '. ' + Warning;
+    end;
   end;
 
+  Result.AddPair('resultCode', TJSONNumber.Create(ResCheck));
+  Result.AddPair('description', Desc);
   Result.AddPair('accepted', TJSONBool.Create(Accepted));
+  if Warning <> '' then
+    Result.AddPair('warning', Warning);
   UpsertMarkCacheKkt(MarkDecoded, ReturnCheck, Accepted, ResCheck, Desc);
 end;
 
@@ -2998,8 +3196,8 @@ begin
       for I := 0 to High(MarksB64) do
       begin
         MarkDecoded := DecodeMarkBase64(MarksB64[I]);
-        FLog.LogInfo(Format('Проверка марки [%d/%d], длина=%d',
-          [I + 1, Length(MarksB64), Length(MarkDecoded)]));
+        FLog.LogInfo(Format('Проверка марки [%d/%d]: %s',
+          [I + 1, Length(MarksB64), MarkForLog(MarkDecoded)]));
 
         if IsMarkFullyOk(MarkDecoded, ReturnCheck, CheckPermission) then
         begin
