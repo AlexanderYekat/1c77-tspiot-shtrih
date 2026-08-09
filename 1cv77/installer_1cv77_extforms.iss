@@ -8,7 +8,7 @@
 ; PrivilegesRequired=lowest — must run as the same user as 1C (HKCU Titles).
 
 #define MyAppName "1C77 ExtForms Deploy"
-#define MyAppVersion "2026.07.23.01"
+#define MyAppVersion "2026.07.26.02"
 #define MyAppPublisher "CTO KSM"
 #define MyAppDirName "1cv77_extforms"
 
@@ -30,10 +30,10 @@ SolidCompression=yes
 PrivilegesRequired=lowest
 MinVersion=6.1sp1
 CloseApplications=no
+ShowLanguageDialog=no
 
 [Languages]
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
-Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 ; Staging only — real deploy is done in [Code] to the 1C IB path from registry
@@ -110,6 +110,88 @@ begin
     end;
   end;
   Result := N > 0;
+end;
+
+function CharToLowerOrd(O: Integer): Integer;
+begin
+  if (O >= Ord('A')) and (O <= Ord('Z')) then
+    Result := O + 32
+  else if (O >= $0410) and (O <= $042F) then
+    Result := O + $20
+  else if O = $0401 then
+    Result := $0451
+  else
+    Result := O;
+end;
+
+{ Case-insensitive "сургут" via ordinals only — no DLL, no Chr(), no Cyrillic literals. }
+function TitleContainsSurgut(const Title: String): Boolean;
+var
+  I, TL: Integer;
+  Ok: Boolean;
+begin
+  Result := False;
+  TL := Length(Title);
+  if TL < 6 then
+    Exit;
+  for I := 1 to TL - 5 do
+  begin
+    Ok := True;
+    { с у р г у т = $0441 $0443 $0440 $0433 $0443 $0442 }
+    if CharToLowerOrd(Ord(Title[I]))     <> $0441 then Ok := False;
+    if Ok and (CharToLowerOrd(Ord(Title[I+1])) <> $0443) then Ok := False;
+    if Ok and (CharToLowerOrd(Ord(Title[I+2])) <> $0440) then Ok := False;
+    if Ok and (CharToLowerOrd(Ord(Title[I+3])) <> $0433) then Ok := False;
+    if Ok and (CharToLowerOrd(Ord(Title[I+4])) <> $0443) then Ok := False;
+    if Ok and (CharToLowerOrd(Ord(Title[I+5])) <> $0442) then Ok := False;
+    if Ok then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+{ If any IB title contains "сургут", keep only those; otherwise leave the full list.
+  Copy element-by-element: dynamic array assignment is unreliable in Inno Pascal Script. }
+procedure FilterSurgutBases();
+var
+  TmpPaths, TmpTitles: TArrayOfString;
+  I, N, Total: Integer;
+begin
+  Total := GetArrayLength(BaseTitles);
+  SetArrayLength(TmpPaths, Total);
+  SetArrayLength(TmpTitles, Total);
+  for I := 0 to Total - 1 do
+  begin
+    TmpPaths[I] := BasePaths[I];
+    TmpTitles[I] := BaseTitles[I];
+  end;
+
+  N := 0;
+  for I := 0 to Total - 1 do
+  begin
+    if TitleContainsSurgut(TmpTitles[I]) then
+    begin
+      TmpPaths[N] := TmpPaths[I];
+      TmpTitles[N] := TmpTitles[I];
+      N := N + 1;
+    end;
+  end;
+
+  if N > 0 then
+  begin
+    SetArrayLength(BasePaths, N);
+    SetArrayLength(BaseTitles, N);
+    for I := 0 to N - 1 do
+    begin
+      BasePaths[I] := TmpPaths[I];
+      BaseTitles[I] := TmpTitles[I];
+    end;
+    Log('Filtered to Surgut bases: ' + IntToStr(N));
+  end
+  else
+    Log('No Surgut bases found, keeping all: ' + IntToStr(Total));
 end;
 
 function IsEquipFile(const FileName: String): Boolean;
@@ -262,6 +344,8 @@ begin
     Result := False;
     Exit;
   end;
+
+  FilterSurgutBases();
 
   if GetArrayLength(BasePaths) = 1 then
     SelectedBasePath := BasePaths[0]
