@@ -6,7 +6,7 @@ uses
   System.SysUtils, System.Variants, System.JSON, System.IniFiles,
   System.SyncObjs, System.NetEncoding, System.Generics.Collections,
   System.Classes, System.DateUtils, Winapi.Windows, Winapi.ActiveX,
-  ComObj, uKktLog, uFormSettings;
+  ComObj, uKktLog, uFormSettings, uReceiptJournal;
 
 type
   TCheckMarkTaskEntry = class
@@ -40,6 +40,8 @@ type
     FMarkTasksLock: TCriticalSection;
     FMarkTasks: TObjectDictionary<string, TCheckMarkTaskEntry>;
     FMarkCache: TDictionary<string, TMarkCacheEntry>; // кэш ККТ+РР в рамках текущего чека
+    FReceipts: TReceiptJournal;
+    FManagedReceipt, FReceiptStarted, FReceiptClosed: Boolean;
     FConnected: Boolean;       // текущее состояние соединения, как мы его понимаем
     FEmulation: Boolean;
     FTestReceiptMode: Boolean; // тестовый режим: CancelCheck вместо FNCloseCheckEx
@@ -61,6 +63,9 @@ type
     FFrError: string;
     FFrStop: Boolean;
 
+    function PrintCheckCore(const Body: string): string;
+    function ExecuteManagedReceipt(const Body: string): string;
+    procedure WaitReceiptReady;
     procedure StartFrComThread;
     procedure StopFrComThread;
     procedure ExecOnFrThread(const Proc: TProc);
@@ -69,6 +74,7 @@ type
     function CheckLinkAlive: Boolean;
     procedure CheckFRResult(const Place: string);
     function ReadSerialNumber: string;
+    function ReadOrganizationName(const Inn: string): string;
     function ReadCheckNumberAfterClose: Integer;
     function ReadSessionNumberAfterClose: Integer;
     function FRObjectReady: Boolean;
@@ -138,14 +144,22 @@ type
     function ExtractFirstTruemarkCode(Truemark: TJSONObject): TJSONObject;
     procedure AddTruemarkFields(PermObj, Truemark: TJSONObject);
     function ParsePermissionCheckResponse(const ResponseBody: string): TJSONObject;
-    function CheckSingleMarkPermission(const MarkB64, Inn, Fn: string): TJSONObject;
+  protected
+    function CheckSingleMarkPermission(const MarkB64, Inn, Fn: string): TJSONObject; virtual;
+    function ReceiptCommandCode(const Place: string; const Proc: TProc): Integer; virtual;
+    function ReceiptSubmode: Integer; virtual;
+    procedure ReceiptContinue; virtual;
+    procedure ReceiptCommandDone(const Place: string); virtual;
   public
+    function ReceiptStatusJson(const Id: string): string;
+    function ReceiptBusy: Boolean;
     constructor Create(ASettings: TCustomIniFile);
     destructor Destroy; override;
 
-    function KktInfoJson: string;
+    function KktInfoJson(IncludeOrganizationName: Boolean = False): string;
     function KktConnectionStatusJson: string;
     function PrintCheckJson(const Body: string): string;
+    function PrintTextJson(const Body: string): string;
     function CloseShiftJson(const Body: string): string;
     function XReportJson(const Body: string = ''): string;
     function OpenShiftJson(const Body: string = ''): string;
@@ -508,6 +522,8 @@ begin
   FEmulatedCheckNumber := FSettings.ReadInteger('KKT', 'EmulatedCheckNumber', 0);
   FEmulatedSessionNumber := FSettings.ReadInteger('KKT', 'EmulatedSessionNumber', 0);
 
+  FReceipts := TReceiptJournal.Create(FSettings.ReadString('KKT', 'ReceiptJournalPath',
+    IncludeTrailingPathDelimiter(ExtractFilePath(FSettings.FileName)) + 'receipt-journal'));
   StartFrComThread;
 
   if FEmulation then
@@ -569,6 +585,7 @@ end;
 
 destructor TVariantPrint.Destroy;
 begin
+  FReceipts.Free; // Join receipt worker before freeing COM, locks or logging.
   FLock.Enter;
   try
     DoDisconnect;
@@ -667,7 +684,6 @@ var
   Code, Mode: Integer;
   Desc, UserMsg: string;
 begin
-  Code := 0;
   try
     Code := ovObject.ResultCode;
   except
@@ -686,7 +702,6 @@ begin
     FLog.LogError('[FR] ' + Place + ': ' + IntToStr(Code) + ' ' + Desc);
     if not FEmulation then
     begin
-      Mode := -1;
       try
         Mode := ovObject.ECRMode;
       except
@@ -734,20 +749,90 @@ begin
   Result := not (VarIsEmpty(ovObject) or VarIsNull(ovObject));
 end;
 
-procedure TVariantPrint.RunFR(const Place: string; const Proc: TProc);
+function TVariantPrint.ReceiptSubmode: Integer;
+var Mode: Integer;
+begin
+  if FEmulation then Exit(0);
+  Mode := -1;
+  ExecOnFrThread(procedure
+  begin
+    if not FRObjectReady then LogFRSkipped('Receipt status');
+    ovObject.GetECRStatus;
+    CheckFRResult('Receipt status');
+    Mode := ovObject.ECRAdvancedMode;
+  end);
+  Result := Mode;
+end;
+
+procedure TVariantPrint.ReceiptContinue;
 begin
   ExecOnFrThread(procedure
   begin
-    if FEmulation then
-    begin
-      FLog.LogInfo('[FR] ' + Place + ' (emu)');
-      Exit;
-    end;
-    if not FRObjectReady then
-      LogFRSkipped(Place);
-    Proc();
-    CheckFRResult(Place);
+    ovObject.ContinuePrint;
+    CheckFRResult('ContinuePrint');
   end);
+end;
+
+procedure TVariantPrint.ReceiptCommandDone(const Place: string);
+begin
+  // Virtual seam for deterministic printer-state tests; production has no test flags.
+end;
+
+procedure TVariantPrint.WaitReceiptReady;
+var Mode: Integer;
+begin
+  if not FManagedReceipt then Exit;
+  while True do begin
+    if FReceipts.Stopping then raise Exception.Create('Служба остановлена во время печати');
+    Mode := ReceiptSubmode;
+    case Mode of
+      0: begin FReceipts.Progress('running', 'Продолжается прежний чек'); Exit; end;
+      1, 2: FReceipts.Progress('waiting_for_paper', 'Замените бумагу. Печать этого чека продолжится автоматически.');
+      3: begin
+        FReceipts.Progress('printing', 'Продолжается печать после замены бумаги');
+        ReceiptContinue;
+      end;
+      4, 5: FReceipts.Progress('printing', 'ККТ печатает прежнюю операцию');
+    else raise Exception.Create('Неизвестный подрежим ККТ: ' + IntToStr(Mode));
+    end;
+    TThread.Sleep(250);
+  end;
+end;
+
+function TVariantPrint.ReceiptCommandCode(const Place: string; const Proc: TProc): Integer;
+var Code: Integer;
+begin
+  Code := 0;
+  ExecOnFrThread(procedure
+  begin
+    if FEmulation then begin FLog.LogInfo('[FR] ' + Place + ' (emu)'); Exit; end;
+    if not FRObjectReady then LogFRSkipped(Place);
+    Proc();
+    Code := ovObject.ResultCode;
+    // Device refusal, not a lost response: the requested command was not accepted.
+    if not (FManagedReceipt and ((Code = 80) or (Code = 107))) then CheckFRResult(Place);
+  end);
+  Result := Code;
+end;
+
+procedure TVariantPrint.RunFR(const Place: string; const Proc: TProc);
+var Code: Integer;
+begin
+  repeat
+    WaitReceiptReady;
+    if FManagedReceipt and ((Place = 'FNOperation') or (Place = 'PrintString') or
+      (Place = 'FNCloseCheckEx')) then FReceiptStarted := True;
+    Code := ReceiptCommandCode(Place, Proc);
+    if Code = 107 then FReceipts.Progress('waiting_for_paper', 'Замените бумагу. Печать этого чека продолжится автоматически.');
+    if Code = 80 then FReceipts.Progress('printing', 'ККТ печатает предыдущую команду');
+    if (Code = 80) or (Code = 107) then TThread.Sleep(250);
+  until (Code <> 80) and (Code <> 107);
+  if FManagedReceipt then begin
+    if Place = 'FNCloseCheckEx' then FReceiptClosed := True;
+    ReceiptCommandDone(Place);
+    // Keep this exact call stack while paper is replaced; do not replay the command.
+    WaitReceiptReady;
+  end;
 end;
 
 procedure TVariantPrint.LogFRSkipped(const Place: string);
@@ -1023,9 +1108,55 @@ end;
  /info
 -------------------------------------------------------------------------------}
 
-function TVariantPrint.KktInfoJson: string;
+function TVariantPrint.ReadOrganizationName(const Inn: string): string;
+const
+  FiscalStorageTable = 18;
+  FiscalStorageRow = 1;
+  TaxpayerInnField = 2;
+  TaxpayerNameField = 7;
 var
-  SerialNumber, KKTRegistrationNumber, Inn, FnNumber: string;
+  TableInn: string;
+
+  function ReadField(FieldNumber: Integer; const FieldName: string): string;
+  var
+    Value: string;
+  begin
+    Value := '';
+    RunFR('ReadTable fiscal storage', procedure
+    begin
+      ovObject.TableNumber := FiscalStorageTable;
+      ovObject.RowNumber := FiscalStorageRow;
+      ovObject.FieldNumber := FieldNumber;
+      ovObject.GetFieldStruct;
+      CheckFRResult('GetFieldStruct fiscal storage');
+      if not SameText(Trim(VarToStr(ovObject.FieldName)), FieldName) then
+        Exit;
+      ovObject.ReadTable;
+      CheckFRResult('ReadTable fiscal storage');
+      Value := Trim(VarToStr(ovObject.ValueOfFieldString));
+    end);
+    Result := Value;
+  end;
+
+begin
+  Result := '';
+  if FEmulation or (Trim(Inn) = '') then
+    Exit;
+
+  try
+    // Some driver versions pad the INN from FNGetFiscalizationResult to 12 digits.
+    TableInn := ReadField(TaxpayerInnField, 'Inn');
+    if (TableInn <> '') and (TableInn.PadLeft(12, '0') = Trim(Inn).PadLeft(12, '0')) then
+      Result := ReadField(TaxpayerNameField, 'User');
+  except
+    on E: Exception do
+      FLog.LogInfo('KktInfoJson: название организации недоступно');
+  end;
+end;
+
+function TVariantPrint.KktInfoJson(IncludeOrganizationName: Boolean): string;
+var
+  SerialNumber, KKTRegistrationNumber, Inn, FnNumber, OrganizationJson: string;
 begin
   FLock.Enter;
   try
@@ -1069,9 +1200,15 @@ begin
        if FnNumber = '' then FnNumber := FEmulatedFnNumber;
       end;
 
+      OrganizationJson := '';
+      if IncludeOrganizationName then
+        OrganizationJson := '"organizationName":"' +
+          JsonEscape(ReadOrganizationName(Inn)) + '",';
+
       Result := JsonOk(
         '"serialNumber":"' + JsonEscape(SerialNumber) + '",' +
         '"inn":"'       + JsonEscape(Inn) + '",' +
+        OrganizationJson +
         '"regNumber":"' + JsonEscape(KKTRegistrationNumber) + '",' +
         '"fnNumber":"'  + JsonEscape(FnNumber) + '",' +
         '"connected":'  + BoolToStr(FConnected, True).ToLower + ',' +
@@ -1729,7 +1866,35 @@ begin
   end;
 end;
 
+function TVariantPrint.ReceiptStatusJson(const Id: string): string;
+begin Result := FReceipts.Status(Id); end;
+
+function TVariantPrint.ReceiptBusy: Boolean;
+begin Result := FReceipts.Busy; end;
+
 function TVariantPrint.PrintCheckJson(const Body: string): string;
+var Req: TJSONObject; Id: string;
+begin
+  Req := ParseJsonObjectOrRaise(Body, 'PrintCheckJson', FLog);
+  try Id := JStr(Req, 'operationId'); finally Req.Free; end;
+  if Id = '' then begin
+    if ReceiptBusy then Exit(JsonError('Продолжается предыдущий чек'));
+    Exit(PrintCheckCore(Body));
+  end;
+  Result := FReceipts.Submit(Id, Body, ExecuteManagedReceipt);
+end;
+
+function TVariantPrint.ExecuteManagedReceipt(const Body: string): string;
+begin
+  FLock.Enter;
+  try
+    FManagedReceipt := True;
+    try Result := PrintCheckCore(Body);
+    finally FManagedReceipt := False; end;
+  finally FLock.Leave; end;
+end;
+
+function TVariantPrint.PrintCheckCore(const Body: string): string;
 var
   Req, Item: TJSONObject;
   Items: TJSONArray;
@@ -1742,6 +1907,7 @@ begin
   try
     Result := JsonError('Unknown error');
     Req := nil;
+    FReceiptStarted := False; FReceiptClosed := False;
     try
       FLog.LogInfo('PrintCheckJson begin');
       EnsureFRConnected;
@@ -1803,7 +1969,7 @@ begin
           FLog.LogInfo('Тестовый режим: CutCheck пропущен');
 
         Result := JsonOk(
-          '"checkNumber":' + IntToStr(CheckNumber) + ',' +
+          '"state":"completed","checkNumber":' + IntToStr(CheckNumber) + ',' +
           '"serialNumber":"' + JsonEscape(SerialNumber) + '"');
 
         FLog.LogInfo(Format('PrintCheckJson OK checkNumber=%d serial=%s',
@@ -1815,32 +1981,22 @@ begin
       on E: Exception do
       begin
         FLog.LogError('PrintCheckJson: ' + E.Message);
-        if FEmulation then
-        begin
-          RunFR('CancelCheck after error', procedure
-          begin
-            ovObject.CancelCheck;
-          end);
-          ClearMarkCache;
-          Inc(FEmulatedCheckNumber);
-          Result := JsonOk(
-            '"checkNumber":' + IntToStr(FEmulatedCheckNumber) + ',' +
-            '"serialNumber":"' + JsonEscape(FEmulatedSerial) + '"');
-          AfterCommand(Req);
-        end
-        else
-        begin
-          try
-            RunFR('CancelCheck after error', procedure
-            begin
-              ovObject.CancelCheck;
-            end);
-          except
-          end;
-          ClearMarkCache;
-          Result := JsonError(E.Message);
-        end;
+        // Never cancel or manufacture success after an uncertain device outcome.
+        // In particular, a closed fiscal receipt must never become a new sale.
+        Result := JsonError(E.Message);
+
       end;
+    end;
+    if FManagedReceipt then begin
+      Item := TJSONObject.ParseJSONValue(Result) as TJSONObject;
+      try
+        if Item.GetValue('state') = nil then begin
+          if FReceiptStarted then Item.AddPair('state', 'uncertain')
+          else Item.AddPair('state', 'rejected');
+        end;
+        Item.AddPair('fiscalClosed', TJSONBool.Create(FReceiptClosed));
+        Result := Item.ToJSON;
+      finally Item.Free; end;
     end;
     Req.Free;
   finally
@@ -1852,6 +2008,58 @@ end;
  Служебные команды
 -------------------------------------------------------------------------------}
 
+function TVariantPrint.PrintTextJson(const Body: string): string;
+var
+  Req: TJSONObject;
+  TextValue: TJSONValue;
+  Lines: TStringList;
+  I, Mode: Integer;
+  Text: string;
+begin
+  FLock.Enter;
+  try
+    Req := nil;
+    Lines := nil;
+    try
+      // Validate before connecting; malformed input is never emulated as success.
+      Req := ParseJsonObjectOrRaise(Body, 'PrintTextJson', FLog);
+      TextValue := Req.GetValue('text');
+      if not (TextValue is TJSONString) then
+        raise Exception.Create('print-text: text must be a string');
+      Text := TJSONString(TextValue).Value;
+      if Trim(Text) = '' then
+        raise Exception.Create('print-text: text is empty');
+      if Length(Text) > 65536 then
+        raise Exception.Create('print-text: text is too long');
+      EnsureFRConnected;
+      if not FEmulation then
+      begin
+        Mode := ReadECRMode;
+        if (Mode <> 0) and (Mode <> 2) and (Mode <> 3) and (Mode <> 4) then
+          raise Exception.Create(MessageForBlockedECRMode(Mode));
+      end;
+      Lines := TStringList.Create;
+      Lines.Text := Text.Replace(#13#10, #10).Replace(#13, #10);
+      for I := 0 to Lines.Count - 1 do
+        PrintReceiptText(Lines[I]);
+      CutCheckWithWait;
+      Result := JsonOk('"emulation":' + LowerCase(BoolToStr(FEmulation, True)));
+      FLog.LogInfo('PrintTextJson OK lines=' + IntToStr(Lines.Count));
+      AfterCommand(Req);
+    except
+      on E: Exception do
+      begin
+        FLog.LogError('PrintTextJson: ' + E.Message);
+        Result := JsonError(E.Message);
+      end;
+    end;
+    Lines.Free;
+    Req.Free;
+  finally
+    FLock.Leave;
+  end;
+end;
+
 function TVariantPrint.CloseShiftJson(const Body: string): string;
 var
   V: TJSONValue;
@@ -1861,10 +2069,10 @@ begin
   FLock.Enter;
   try
     V := nil;
+    Req := nil;
     try
       FLog.LogInfo('CloseShiftJson begin');
       V := TJSONObject.ParseJSONValue(Body);
-      Req := nil;
       if V is TJSONObject then
         Req := TJSONObject(V);
 
@@ -2406,7 +2614,8 @@ begin
 
         if CheckPermission then
         begin
-          if TryGetMarkFromCache(MarkDecoded, ReturnCheck, Cached) and Cached.RrChecked then
+          // Retry a rejected permission check: subscription/network state may have changed.
+          if TryGetMarkFromCache(MarkDecoded, ReturnCheck, Cached) and Cached.RrChecked and Cached.RrAccepted then
           begin
             FLog.LogInfo(Format('pre-flight РР [%d]: из кэша — skip POST /document', [I + 1]));
             PermObj := PermissionObjFromCacheEntry(Cached);
@@ -2515,34 +2724,7 @@ begin
   if Mode <> 8 then
     Exit;
 
-  // Сначала ContinuePrint (докатить прерванную печать), затем CancelCheck
-  FLog.LogInfo(Context + ': открыт документ — пробуем ContinuePrint');
-  try
-    RunFR('ContinuePrint ' + Context, procedure
-    begin
-      ovObject.ContinuePrint;
-    end);
-  except
-    on E: Exception do
-      FLog.LogInfo(Context + ': ContinuePrint не помог — ' + E.Message);
-  end;
-  RefreshECRStatus('GetECRStatus after ContinuePrint ' + Context);
-  Mode := ReadECRMode;
-  FLog.LogInfo(Context + ' after ContinuePrint: ECRMode=' + IntToStr(Mode) +
-    ' (' + ECRModeCaption(Mode) + ')');
-
-  if Mode <> 8 then
-    Exit;
-
-  FLog.LogInfo(Context + ': документ всё ещё открыт — CancelCheck');
-  RunFR('CancelCheck ' + Context, procedure
-  begin
-    ovObject.CancelCheck;
-  end);
-  RefreshECRStatus('GetECRStatus after CancelCheck ' + Context);
-  Mode := ReadECRMode;
-  FLog.LogInfo(Context + ' after CancelCheck: ECRMode=' + IntToStr(Mode) +
-    ' (' + ECRModeCaption(Mode) + ')');
+  raise Exception.Create(Context + ': на ККТ открыт прежний чек. Завершите его; автоматическая отмена не выполняется.');
 end;
 
 procedure TVariantPrint.DoOpenSession(const CashierName: string);
@@ -2925,7 +3107,9 @@ begin
     Pos := TJSONObject.Create;
     Org := TJSONObject.Create;
     Org.AddPair('inn', Inn);
-    Pos.AddPair('organization', Org);
+    // fmu-api читает ИНН только из "organisation" (через s). С "organization" ИНН теряется,
+    // организация не определяется и проверка не уходит в ТС ПиОТ.
+    Pos.AddPair('organisation', Org);
 
     CodesArr := TJSONArray.Create;
     CodesArr.AddElement(TJSONString.Create(MarkB64));
@@ -3225,7 +3409,8 @@ begin
         try
           if CheckPermission and not ReturnCheck then
           begin
-            if TryGetMarkFromCache(MarkDecoded, ReturnCheck, Cached) and Cached.RrChecked then
+            // Retry a rejected permission check: subscription/network state may have changed.
+          if TryGetMarkFromCache(MarkDecoded, ReturnCheck, Cached) and Cached.RrChecked and Cached.RrAccepted then
             begin
               FLog.LogInfo(Format('РР [%d/%d] из кэша — skip POST /document',
                 [I + 1, Length(MarksB64)]));

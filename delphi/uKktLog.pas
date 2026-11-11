@@ -1,4 +1,4 @@
-unit uKktLog;
+﻿unit uKktLog;
 
 interface
 
@@ -17,9 +17,11 @@ type
     FLevel: TKktLogLevel;
     FPath: string;
     FMaxBodyLen: Integer;
+    FLastHealthLog: TDateTime;
     FOnLogLine: TKktLogLineEvent;
     procedure WriteLine(const Prefix, Msg: string);
     function LevelEnabled(ALevel: TKktLogLevel): Boolean;
+    function ShouldLogHealthRequest: Boolean;
   public
     constructor Create(ASettings: TCustomIniFile; const DefaultPath: string);
     destructor Destroy; override;
@@ -37,6 +39,8 @@ type
 
 implementation
 
+var LogFileLock: TCriticalSection;
+
 { TKktLogger }
 
 constructor TKktLogger.Create(ASettings: TCustomIniFile; const DefaultPath: string);
@@ -49,6 +53,7 @@ begin
   FUiEnabled := ASettings.ReadBool('Log', 'UiEnabled', True);
   FPath := ASettings.ReadString('Log', 'Path', DefaultPath);
   FMaxBodyLen := ASettings.ReadInteger('Log', 'MaxBodyLen', 4096);
+  FLastHealthLog := 0;
 
   LevelStr := LowerCase(Trim(ASettings.ReadString('Log', 'Level', 'info')));
   if LevelStr = 'off' then
@@ -75,7 +80,7 @@ end;
 procedure TKktLogger.WriteLine(const Prefix, Msg: string);
 var
   Line: string;
-  SL: TStringList;
+  Stream: TFileStream; Bytes: TBytes;
   Handler: TKktLogLineEvent;
 begin
   Line := FormatDateTime('yyyy-mm-dd hh:nn:ss.zzz', Now) + ' [' + Prefix + '] ' + Msg;
@@ -90,20 +95,23 @@ begin
   if not FEnabled or (FLevel = llOff) then
     Exit;
 
-  FLock.Enter;
+  // Printer and HTTP server use separate logger instances for the same file.
+  // Log I/O must never turn an accepted fiscal command into a failed operation.
+  LogFileLock.Enter;
   try
-    SL := TStringList.Create;
     try
-      if FileExists(FPath) then
-        SL.LoadFromFile(FPath, TEncoding.UTF8);
-      SL.Add(Line);
-      SL.SaveToFile(FPath, TEncoding.UTF8);
-    finally
-      SL.Free;
+      if FileExists(FPath) then Stream := TFileStream.Create(FPath, fmOpenReadWrite or fmShareDenyWrite)
+      else Stream := TFileStream.Create(FPath, fmCreate or fmShareDenyWrite);
+      try
+        Stream.Seek(0, soEnd);
+        Bytes := TEncoding.UTF8.GetBytes(Line + sLineBreak);
+        Stream.WriteBuffer(Bytes[0], Length(Bytes));
+      finally Stream.Free; end;
+    except
+      on E: EInOutError do ;
+      on E: EStreamError do ;
     end;
-  finally
-    FLock.Leave;
-  end;
+  finally LogFileLock.Leave; end;
 end;
 
 procedure TKktLogger.LogError(const Msg: string);
@@ -124,11 +132,36 @@ begin
     WriteLine('DEBUG', Msg);
 end;
 
+function TKktLogger.ShouldLogHealthRequest: Boolean;
+const
+  // Proxy опрашивает /health ~каждые 15 с — на info не чаще раза в 5 мин
+  HealthLogIntervalSec = 300;
+begin
+  // debug: каждый запрос; info: с троттлингом
+  if LevelEnabled(llDebug) then
+    Exit(True);
+
+  FLock.Enter;
+  try
+    Result := (FLastHealthLog = 0) or
+      (SecondsBetween(Now, FLastHealthLog) >= HealthLogIntervalSec);
+    if Result then
+      FLastHealthLog := Now;
+  finally
+    FLock.Leave;
+  end;
+end;
+
 procedure TKktLogger.LogHttp(const Method, Path, Body, Response: string);
 var
   BodyPart, RespPart: string;
 begin
   if not LevelEnabled(llInfo) then
+    Exit;
+
+  // GET /health от proxy не засоряет UI/файл на уровне info
+  if SameText(Method, 'GET') and SameText(Path, '/health') and
+     not ShouldLogHealthRequest then
     Exit;
 
   BodyPart := Body;
@@ -143,4 +176,8 @@ begin
     [Method, Path, BodyPart, RespPart]));
 end;
 
+initialization
+  LogFileLock := TCriticalSection.Create;
+finalization
+  LogFileLock.Free;
 end.

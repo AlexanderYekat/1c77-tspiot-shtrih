@@ -11,6 +11,7 @@ object kktServerIndyForm: TkktServerIndyForm
   Font.Name = 'Segoe UI'
   Font.Style = []
   WindowState = wsMinimized
+  OnCloseQuery = FormCloseQuery
   OnCreate = FormCreate
   OnDestroy = FormDestroy
   TextHeight = 15

@@ -8,13 +8,20 @@ uses
   uVariantPrint; // ваш модуль с KktInfoJson, PrintCheckJson и т.д.
 
 type
+  /// Вызывается из потока Indy при POST/GET /exit (до реального Terminate).
+  THttpExitRequestEvent = procedure(Sender: TObject) of object;
+
   TFmuHttpServer = class
   private
     FServer: TIdHTTPServer;
     FVariantPrint: TVariantPrint;
     FServiceName: string;
     FServiceVersion: string;
+    FComponentId: string;
+    FCanonVersion: string;
+    FOnExitRequest: THttpExitRequestEvent;
     function BuildHealthJson: string;
+    function BuildVersionJson: string;
     procedure ServerCommandGet(AContext: TIdContext;
       ARequestInfo: TIdHTTPRequestInfo;
       AResponseInfo: TIdHTTPResponseInfo);
@@ -27,11 +34,14 @@ type
     function GetActive:boolean;
   public
     class function ReadExeFileVersion: string;
+    class function ReadExeCanonVersion: string;
     constructor Create(APort: Integer; AVariantPrint: TVariantPrint);
     destructor Destroy; override;
     procedure Start;
     procedure Stop;
     property Active:boolean read GetActive;
+    /// Updater / админ: единственный штатный способ завершить процесс.
+    property OnExitRequest: THttpExitRequestEvent read FOnExitRequest write FOnExitRequest;
   end;
 
 implementation
@@ -74,11 +84,71 @@ begin
   end;
 end;
 
+class function TFmuHttpServer.ReadExeCanonVersion: string;
+var
+  Size, Dummy, Len: DWORD;
+  Buffer: Pointer;
+  TransPtr: Pointer;
+  Lang, CodePage: Word;
+  LangCode, Query, Product: string;
+  P: Pointer;
+  Fixed: PVSFixedFileInfo;
+  Y, M, D, N: Integer;
+begin
+  Result := '';
+  Size := GetFileVersionInfoSize(PChar(ParamStr(0)), Dummy);
+  if Size = 0 then
+    Exit;
+  GetMem(Buffer, Size);
+  try
+    if not GetFileVersionInfo(PChar(ParamStr(0)), 0, Size, Buffer) then
+      Exit;
+
+    Product := '';
+    if VerQueryValue(Buffer, '\VarFileInfo\Translation', TransPtr, Len) and
+       (TransPtr <> nil) and (Len >= 4) then
+    begin
+      Lang := PWordArray(TransPtr)^[0];
+      CodePage := PWordArray(TransPtr)^[1];
+      LangCode := Format('%.4x%.4x', [Lang, CodePage]);
+      Query := '\StringFileInfo\' + LangCode + '\ProductVersion';
+      if VerQueryValue(Buffer, PChar(Query), P, Len) and (P <> nil) then
+        Product := Trim(string(PChar(P)));
+    end;
+
+    if (Length(Product) >= 13) and (Product[5] = '.') and (Product[8] = '.') and
+       (Pos('-', Product) > 0) then
+    begin
+      Result := Product;
+      Exit;
+    end;
+
+    if VerQueryValue(Buffer, '\', Pointer(Fixed), Len) and (Fixed <> nil) then
+    begin
+      Y := HiWord(Fixed^.dwFileVersionMS);
+      M := LoWord(Fixed^.dwFileVersionMS);
+      D := HiWord(Fixed^.dwFileVersionLS);
+      N := LoWord(Fixed^.dwFileVersionLS);
+      if (Y > 0) and (M >= 1) and (M <= 12) and (D >= 1) and (D <= 31) and (N >= 0) then
+        Result := Format('%.4d.%.2d.%.2d-%.2d', [Y, M, D, N]);
+    end;
+  finally
+    FreeMem(Buffer);
+  end;
+end;
+
 function TFmuHttpServer.BuildHealthJson: string;
 begin
   Result := Format(
     '{"result":1,"description":"OK","service":"%s","status":"up","version":"%s"}',
     [JsonEscapeHealth(FServiceName), JsonEscapeHealth(FServiceVersion)]);
+end;
+
+function TFmuHttpServer.BuildVersionJson: string;
+begin
+  Result := Format(
+    '{"component":"%s","version":"%s"}',
+    [JsonEscapeHealth(FComponentId), JsonEscapeHealth(FCanonVersion)]);
 end;
 
 constructor TFmuHttpServer.Create(APort: Integer; AVariantPrint: TVariantPrint);
@@ -87,6 +157,10 @@ begin
   FVariantPrint := AVariantPrint;
   FServiceName := 'kktserverindy';
   FServiceVersion := ReadExeFileVersion;
+  FComponentId := 'shtrih-service';
+  FCanonVersion := ReadExeCanonVersion;
+  if FCanonVersion = '' then
+    FCanonVersion := '0.0.0.0-00';
   FServer := TIdHTTPServer.Create(nil);
   FServer.DefaultPort := APort;
   FServer.OnCommandGet := ServerCommandGet;
@@ -168,9 +242,29 @@ begin
       ResultJson := BuildHealthJson;
       WriteJson(AResponseInfo, ResultJson);
     end
+    else if (Method = 'GET') and (Path = '/version') then
+    begin
+      ResultJson := BuildVersionJson;
+      WriteJson(AResponseInfo, ResultJson);
+    end
+    else if ((Method = 'POST') or (Method = 'GET')) and (Path = '/exit') then
+    begin
+      // Ответ до Terminate: клиент (updater) ждёт закрытия TCP / выхода процесса.
+      ResultJson := '{"result":1,"description":"exiting"}';
+      WriteJson(AResponseInfo, ResultJson);
+      if Assigned(FOnExitRequest) then
+        FOnExitRequest(Self);
+    end
+    else if FVariantPrint.ReceiptBusy and (Path <> '/print-check') and
+      (Path <> '/print-check/status') then
+    begin
+      ResultJson := '{"result":0,"state":"busy","description":"Продолжается прежний чек; его состояние доступно по operationId"}';
+      WriteJson(AResponseInfo, ResultJson);
+    end
     else if (Method = 'GET') and (Path = '/info') then
     begin
-      ResultJson := FVariantPrint.KktInfoJson;
+      ResultJson := FVariantPrint.KktInfoJson(
+        ARequestInfo.Params.Values['includeOrganizationName'] = '1');
       WriteJson(AResponseInfo, ResultJson);
     end
     else if (Method = 'GET') and (Path = '/connection-status') then
@@ -178,10 +272,21 @@ begin
       ResultJson := FVariantPrint.KktConnectionStatusJson;
       WriteJson(AResponseInfo, ResultJson);
     end
+    else if (Method = 'GET') and (Path = '/print-check/status') then
+    begin
+      ResultJson := FVariantPrint.ReceiptStatusJson(ARequestInfo.Params.Values['operationId']);
+      WriteJson(AResponseInfo, ResultJson);
+    end
     else if (Method = 'POST') and (Path = '/print-check') then
     begin
       Body := ReadBody(ARequestInfo);
       ResultJson := FVariantPrint.PrintCheckJson(Body);
+      WriteJson(AResponseInfo, ResultJson);
+    end
+    else if (Method = 'POST') and (Path = '/print-text') then
+    begin
+      Body := ReadBody(ARequestInfo);
+      ResultJson := FVariantPrint.PrintTextJson(Body);
       WriteJson(AResponseInfo, ResultJson);
     end
     else if (Method = 'POST') and (Path = '/close-shift') then
