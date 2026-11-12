@@ -277,6 +277,12 @@ begin
       ResultJson := FVariantPrint.ReceiptStatusJson(ARequestInfo.Params.Values['operationId']);
       WriteJson(AResponseInfo, ResultJson);
     end
+    else if (Method = 'POST') and (Path = '/print-check/resolve') then
+    begin
+      Body := ReadBody(ARequestInfo);
+      ResultJson := FVariantPrint.ResolveReceiptJson(Body);
+      WriteJson(AResponseInfo, ResultJson);
+    end
     else if (Method = 'POST') and (Path = '/print-check') then
     begin
       Body := ReadBody(ARequestInfo);

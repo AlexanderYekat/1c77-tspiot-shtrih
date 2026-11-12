@@ -140,11 +140,11 @@ type
     function ResolvePermissionInn(Req: TJSONObject): string;
     function ResolvePermissionFn(Req: TJSONObject): string;
     function BuildDocumentCheckJson(const MarkB64, Inn, Fn: string): string;
-    function HttpPostJson(const Url, Body: string): string;
     function ExtractFirstTruemarkCode(Truemark: TJSONObject): TJSONObject;
     procedure AddTruemarkFields(PermObj, Truemark: TJSONObject);
     function ParsePermissionCheckResponse(const ResponseBody: string): TJSONObject;
   protected
+    function HttpPostJson(const Url, Body: string): string; virtual;
     function CheckSingleMarkPermission(const MarkB64, Inn, Fn: string): TJSONObject; virtual;
     function ReceiptCommandCode(const Place: string; const Proc: TProc): Integer; virtual;
     function ReceiptSubmode: Integer; virtual;
@@ -152,6 +152,7 @@ type
     procedure ReceiptCommandDone(const Place: string); virtual;
   public
     function ReceiptStatusJson(const Id: string): string;
+    function ResolveReceiptJson(const Body: string): string;
     function ReceiptBusy: Boolean;
     constructor Create(ASettings: TCustomIniFile);
     destructor Destroy; override;
@@ -183,7 +184,7 @@ type
 implementation
 
 uses
-  IdHTTP;
+  IdHTTP, uPermissionErrors;
 
 const
   PERMISSION_FMU_HOST = 'localhost';
@@ -1869,6 +1870,27 @@ end;
 function TVariantPrint.ReceiptStatusJson(const Id: string): string;
 begin Result := FReceipts.Status(Id); end;
 
+function TVariantPrint.ResolveReceiptJson(const Body: string): string;
+var Req: TJSONObject; Serial: string;
+begin
+  // Do not wait for a live receipt while holding its device lock.
+  if ReceiptBusy then Exit(JsonError('ККТ ещё выполняет чек; дождитесь результата'));
+  FLock.Enter;
+  try
+    if ReceiptBusy then Exit(JsonError('ККТ ещё выполняет чек; дождитесь результата'));
+    EnsureFRConnected;
+    RefreshECRStatus('Сверка результата чека');
+    // This only checks readiness. Absence of a fiscal sale is confirmed separately
+    // by the operator from FN/OFD records; a closed document alone is not proof.
+    if ReadECRMode = 8 then Exit(JsonError('На ККТ открыт чек. Завершите сверку с кассовым специалистом'));
+    if ReceiptSubmode <> 0 then Exit(JsonError('ККТ не готова к сверке. Проверьте состояние и бумагу'));
+    Serial := ReadSerialNumber;
+    if Trim(Serial) = '' then Exit(JsonError('Не удалось определить заводской номер ККТ'));
+    Req := ParseJsonObjectOrRaise(Body, 'ResolveReceiptJson', FLog);
+    try Result := FReceipts.Resolve(Req, Serial); finally Req.Free; end;
+  finally FLock.Leave; end;
+end;
+
 function TVariantPrint.ReceiptBusy: Boolean;
 begin Result := FReceipts.Busy; end;
 
@@ -3240,7 +3262,7 @@ begin
       V.Free;
     Result.AddPair('accepted', TJSONBool.Create(False));
     Result.AddPair('code', '-1');
-    Result.AddPair('error', 'Некорректный JSON ответа FMU');
+    Result.AddPair('error', 'FMU-API вернул непонятный ответ на проверку марки. Повторите проверку; если ошибка повторяется, обратитесь к специалисту.');
     Exit;
   end;
 
@@ -3254,6 +3276,10 @@ begin
     Err := JStr(Root, 'Error', '');
     if Err = '' then
       Err := JStr(Root, 'error', '');
+    if Err = '' then
+      Err := JStr(Root, 'message', '');
+    if Err = '' then
+      Err := JStr(Root, 'description', '');
 
     Uuid := '';
     TimeStr := '';
@@ -3281,6 +3307,8 @@ begin
 
     Result.AddPair('accepted', TJSONBool.Create(Accepted));
     Result.AddPair('code', CodeStr);
+    if not Accepted then
+      Err := PermissionFailureText(200, CodeStr, Err);
     Result.AddPair('error', Err);
     Result.AddPair('uuid', Uuid);
     Result.AddPair('time', TimeStr);
@@ -3293,7 +3321,7 @@ end;
 
 function TVariantPrint.CheckSingleMarkPermission(const MarkB64, Inn, Fn: string): TJSONObject;
 var
-  Url, ReqJson, RespBody: string;
+  Url, ReqJson, RespBody, FailureCode, FailureDetail: string;
 begin
   // Emulation влияет только на ККТ/ФР; РР всегда идёт на реальный FMU /document
   if FEmulation then
@@ -3309,13 +3337,31 @@ begin
   try
     RespBody := HttpPostJson(Url, ReqJson);
   except
+    on E: EIdHTTPProtocolException do
+    begin
+      // Indy keeps the response body in ErrorMessage; E.Message is only HTTP 400.
+      ReadPermissionFailure(E.ErrorMessage, FailureCode, FailureDetail);
+      FLog.LogError('POST /document (РР): ' + E.Message + '; ' +
+        JsonBodyPreviewPlain(FailureDetail, 1200));
+      Result := TJSONObject.Create;
+      Result.AddPair('accepted', TJSONBool.Create(False));
+      if (FailureCode = '') or (FailureCode = '0') or (FailureCode = '0.0') then
+        FailureCode := '-1';
+      Result.AddPair('code', FailureCode);
+      Result.AddPair('error', PermissionFailureText(E.ErrorCode, FailureCode, FailureDetail));
+      Result.AddPair('uuid', '');
+      Result.AddPair('time', '');
+      Result.AddPair('inst', '');
+      Result.AddPair('version', '');
+      Exit;
+    end;
     on E: Exception do
     begin
       FLog.LogError('POST /document (РР): ' + E.Message);
       Result := TJSONObject.Create;
       Result.AddPair('accepted', TJSONBool.Create(False));
       Result.AddPair('code', '-1');
-      Result.AddPair('error', E.Message);
+      Result.AddPair('error', PermissionFailureText(0, '', E.Message));
       Result.AddPair('uuid', '');
       Result.AddPair('time', '');
       Result.AddPair('inst', '');
